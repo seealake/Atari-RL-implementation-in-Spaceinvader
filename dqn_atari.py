@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """Yes. Run Atari Environment with DQN."""
-"""LINEAR, DQN, DOUBLE DQN, DUELING DQN"""
+"""LINEAR, LINEAR DOUBLE, DQN, DOUBLE DQN, DUELING DQN"""
 import argparse
 import os
 import random
@@ -16,15 +16,8 @@ from deeprl_hw2.preprocessors import AtariPreprocessor, HistoryPreprocessor, Pre
 import matplotlib.pyplot as plt
 import gc
 import pandas as pd
+import scipy as sc
 
-gpus = tf.config.experimental.list_physical_devices('GPU')
-if gpus:
-    try:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        print("GPU memory growth enabled")
-    except RuntimeError as e:
-        print(f"Error enabling GPU memory growth: {e}")
 
 def create_optimizer():
     return tf.keras.optimizers.RMSprop(

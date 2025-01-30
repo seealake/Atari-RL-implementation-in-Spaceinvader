@@ -17,14 +17,6 @@ import matplotlib.pyplot as plt
 import gc
 import pandas as pd
 
-gpus = tf.config.experimental.list_physical_devices('GPU')
-if gpus:
-    try:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        print("GPU memory growth enabled")
-    except RuntimeError as e:
-        print(f"Error enabling GPU memory growth: {e}")
 
 def create_optimizer():
     return tf.keras.optimizers.RMSprop(

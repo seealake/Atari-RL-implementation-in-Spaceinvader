@@ -21,7 +21,7 @@ if gpus:
     try:
         for gpu in gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
-        print("GPU memory growth enabled")
+        print("GPU enabled")
     except RuntimeError as e:
         print(f"Error enabling GPU memory growth: {e}")
 

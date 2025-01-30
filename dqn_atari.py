@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """Yes. Run Atari Environment with DQN."""
-
+"""LINEAR, DQN, DOUBLE DQN, DUELING DQN"""
 import argparse
 import os
 import random

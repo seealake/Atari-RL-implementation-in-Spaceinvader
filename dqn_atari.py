@@ -27,7 +27,7 @@ if gpus:
 
 def create_optimizer():
     return tf.keras.optimizers.RMSprop(
-        learning_rate=3e-4,
+        learning_rate=2.5e-4,
         rho=0.95,
         momentum=0.0,
         epsilon=0.00001,
@@ -169,13 +169,13 @@ def main():
                 input_shape=input_shape,
                 num_actions=num_actions,
                 preprocessor=preprocessor,
-                memory=tfrl.core.ReplayMemory(max_size=500000, frame_height=84, frame_width=84, history_length=4),
+                memory=tfrl.core.ReplayMemory(max_size=1000000, frame_height=84, frame_width=84, history_length=4),
                 policy=policy,
                 gamma=0.99,
                 target_update_freq=10000,
                 num_burn_in=50000,
                 train_freq=4,
-                batch_size=16,
+                batch_size=64,
                 double_q=args.mode in ['linear_double', 'double'],
                 dueling=args.mode == 'dueling',
                 tau=0.001,

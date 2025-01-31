@@ -56,27 +56,21 @@ class DQNAgent:
         states, actions, rewards, next_states, dones = self.memory.sample(self.batch_size)
         states = tf.convert_to_tensor(states, dtype=tf.float32)
         next_states = tf.convert_to_tensor(next_states, dtype=tf.float32)
-
-        rewards = np.clip(rewards, -1, 1) 
-
-        q_values_next = self.q_network(next_states)
-        next_actions = tf.argmax(q_values_next, axis=1)
+    
+        # Compute target Q-values using target network only
         target_q_values_next = self.target_network(next_states)
-        target_values = rewards + self.gamma * tf.reduce_sum(tf.one_hot(next_actions, self.num_actions) * target_q_values_next, axis=1) * (1 - dones)
-
+        max_target_q_values = tf.reduce_max(target_q_values_next, axis=1)
+        target_values = rewards + self.gamma * max_target_q_values * (1 - dones)
+    
         with tf.GradientTape() as tape:
             q_values = self.q_network(states)
             q_values_for_actions = tf.reduce_sum(q_values * tf.one_hot(actions, self.num_actions), axis=1)
             loss = self.loss_func(target_values, q_values_for_actions)
-
+    
         gradients = tape.gradient(loss, self.q_network.trainable_variables)
-        gradients, _ = tf.clip_by_global_norm(gradients, 5.0)  
+        gradients, _ = tf.clip_by_global_norm(gradients, 10.0)  # Gradient clipping
         self.optimizer.apply_gradients(zip(gradients, self.q_network.trainable_variables))
-        assert states.shape[0] == self.batch_size
-        assert actions.shape[0] == self.batch_size
-        assert rewards.shape[0] == self.batch_size
-        assert next_states.shape[0] == self.batch_size
-        assert dones.shape[0] == self.batch_size
+    
         return loss
 
     def soft_update_target_network(self):

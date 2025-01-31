@@ -57,9 +57,14 @@ class DQNAgent:
         states = tf.convert_to_tensor(states, dtype=tf.float32)
         next_states = tf.convert_to_tensor(next_states, dtype=tf.float32)
     
-        # Compute target Q-values using target network only
-        target_q_values_next = self.target_network(next_states)
-        max_target_q_values = tf.reduce_max(target_q_values_next, axis=1)
+        if self.double_q:
+            best_action_indices = tf.argmax(self.q_network(next_states), axis=1)  
+            max_target_q_values = tf.reduce_sum(
+                self.target_network(next_states) * tf.one_hot(best_action_indices, self.num_actions), axis=1
+            )
+        else:
+            max_target_q_values = tf.reduce_max(self.target_network(next_states), axis=1)
+
         target_values = rewards + self.gamma * max_target_q_values * (1 - dones)
     
         with tf.GradientTape() as tape:

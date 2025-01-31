@@ -27,7 +27,7 @@ if gpus:
 
 def create_optimizer():
     return tf.keras.optimizers.RMSprop(
-        learning_rate=2.5e-4,
+        learning_rate=1e-4,
         rho=0.95,
         momentum=0.0,
         epsilon=0.00001,
@@ -45,13 +45,20 @@ def create_linear_model(input_shape, num_actions, model_name='linear_q_network')
 
 def create_deep_q_network(input_shape, num_actions, model_name='deep_q_network'):
     inputs = tf.keras.Input(shape=(input_shape[0], input_shape[1], input_shape[2]))
-    x = tf.keras.layers.Conv2D(16, (8, 8), strides=4, activation='relu')(inputs)
-    x = tf.keras.layers.Conv2D(32, (4, 4), strides=2, activation='relu')(x)
+    x = tf.keras.layers.Conv2D(32, (8, 8), strides=4, activation='relu')(inputs)
+    x = tf.keras.layers.Conv2D(64, (4, 4), strides=2, activation='relu')(x)
+    x = tf.keras.layers.Conv2D(64, (3, 3), strides=1, activation='relu')(x)
+    
     x = tf.keras.layers.Flatten()(x)
-    x = tf.keras.layers.Dense(256, activation='relu')(x)
+    x = tf.keras.layers.Dense(512, activation='relu')(x)  
     outputs = tf.keras.layers.Dense(num_actions, activation=None)(x)
     model = tf.keras.Model(inputs=inputs, outputs=outputs, name=model_name)
-    model.compile(optimizer=create_optimizer(), loss=mean_huber_loss)
+    optimizer = tf.keras.optimizers.RMSprop(
+        learning_rate=0.00025, 
+        rho=0.95,
+        epsilon=0.01
+    )
+    model.compile(optimizer=optimizer, loss='huber') 
     return model
 
 def create_dueling_q_network(input_shape, num_actions, model_name='dueling_q_network'):
@@ -161,7 +168,7 @@ def main():
                 GreedyEpsilonPolicy(1.0),
                 start_value=1.0,
                 end_value=0.05,
-                decay_rate=1e-6
+                decay_rate=1e-5
             )
 
             agent = DQNAgent(
@@ -169,10 +176,10 @@ def main():
                 input_shape=input_shape,
                 num_actions=num_actions,
                 preprocessor=preprocessor,
-                memory=tfrl.core.ReplayMemory(max_size=1000000, frame_height=84, frame_width=84, history_length=4),
+                memory=tfrl.core.ReplayMemory(max_size=500000, frame_height=84, frame_width=84, history_length=4),
                 policy=policy,
                 gamma=0.99,
-                target_update_freq=10000,
+                target_update_freq=5000,
                 num_burn_in=50000,
                 train_freq=4,
                 batch_size=64,

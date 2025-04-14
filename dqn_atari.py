@@ -8,11 +8,11 @@ import numpy as np
 import tensorflow as tf
 import gym
 from gym.wrappers import RecordVideo
-import deeprl_hw2 as tfrl
-from deeprl_hw2.dqn import DQNAgent
-from deeprl_hw2.objectives import mean_huber_loss
-from deeprl_hw2.policy import LinearDecayGreedyEpsilonPolicy, GreedyEpsilonPolicy, ExponentialDecayGreedyEpsilonPolicy
-from deeprl_hw2.preprocessors import AtariPreprocessor, HistoryPreprocessor, PreprocessorSequence
+import deeprl as tfrl
+from deeprl.dqn import DQNAgent
+from deeprl.objectives import mean_huber_loss
+from deeprl.policy import LinearDecayGreedyEpsilonPolicy, GreedyEpsilonPolicy, ExponentialDecayGreedyEpsilonPolicy
+from deeprl.preprocessors import AtariPreprocessor, HistoryPreprocessor, PreprocessorSequence
 import matplotlib.pyplot as plt
 import gc
 

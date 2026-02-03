@@ -25,13 +25,8 @@ if gpus:
         print(f"Error enabling GPU memory growth: {e}")
 
 def create_optimizer():
-    return tf.keras.optimizers.RMSprop(
-        learning_rate=1e-4,
-        rho=0.95,
-        momentum=0.0,
-        epsilon=0.00001,
-        centered=True
-    )
+    """Create Adam optimizer with standard learning rate."""
+    return tf.keras.optimizers.Adam(learning_rate=3e-4)
 
 def create_linear_model(input_shape, num_actions, model_name='linear_q_network'):
     """Create a linear Q-network."""
@@ -43,6 +38,7 @@ def create_linear_model(input_shape, num_actions, model_name='linear_q_network')
     return model
 
 def create_deep_q_network(input_shape, num_actions, model_name='deep_q_network'):
+    """Create a deep Q-network with CNN architecture."""
     inputs = tf.keras.Input(shape=(input_shape[0], input_shape[1], input_shape[2]))
     x = tf.keras.layers.Conv2D(32, (8, 8), strides=4, activation='relu')(inputs)
     x = tf.keras.layers.Conv2D(64, (4, 4), strides=2, activation='relu')(x)
@@ -52,12 +48,7 @@ def create_deep_q_network(input_shape, num_actions, model_name='deep_q_network')
     x = tf.keras.layers.Dense(512, activation='relu')(x)  
     outputs = tf.keras.layers.Dense(num_actions, activation=None)(x)
     model = tf.keras.Model(inputs=inputs, outputs=outputs, name=model_name)
-    optimizer = tf.keras.optimizers.RMSprop(
-        learning_rate=0.00025, 
-        rho=0.95,
-        epsilon=0.01
-    )
-    model.compile(optimizer=optimizer, loss='huber') 
+    model.compile(optimizer=create_optimizer(), loss='huber') 
     return model
 
 def create_dueling_q_network(input_shape, num_actions, model_name='dueling_q_network'):
@@ -73,8 +64,7 @@ def create_dueling_q_network(input_shape, num_actions, model_name='dueling_q_net
     advantage = tf.keras.layers.Dense(num_actions)(advantage_stream)
     q_values = value + (advantage - tf.reduce_mean(advantage, axis=1, keepdims=True))
     model = tf.keras.Model(inputs=inputs, outputs=q_values, name=model_name)
-    optimizer = tf.keras.optimizers.RMSprop(learning_rate=0.00025, rho=0.95, epsilon=0.01)    
-    model.compile(optimizer=optimizer, loss='mse')
+    model.compile(optimizer=create_optimizer(), loss='huber')
     return model
 
 def make_env(env_name, output_directory):
@@ -159,6 +149,18 @@ def main():
         total_iterations = args.iterations
         iterations_done = 0
         all_evaluation_results = []
+        
+        # Create policy and memory outside the loop to preserve state across restarts
+        policy = ExponentialDecayGreedyEpsilonPolicy(
+            GreedyEpsilonPolicy(1.0),
+            start_value=1.0,
+            end_value=0.05,
+            decay_rate=1e-5
+        )
+        memory = tfrl.core.ReplayMemory(max_size=500000, frame_height=84, frame_width=84, history_length=4)
+        
+        # Flag to track if this is the first iteration (for checkpoint loading)
+        first_iteration = True
 
         while iterations_done < total_iterations:
             if args.mode == 'linear' or args.mode == 'linear_double':
@@ -171,20 +173,13 @@ def main():
             atari_preprocessor = AtariPreprocessor(new_size=(84, 84))
             history_preprocessor = HistoryPreprocessor(history_length=4)
             preprocessor = PreprocessorSequence([atari_preprocessor, history_preprocessor])
-            
-            policy = ExponentialDecayGreedyEpsilonPolicy(
-                GreedyEpsilonPolicy(1.0),
-                start_value=1.0,
-                end_value=0.05,
-                decay_rate=1e-5
-            )
 
             agent = DQNAgent(
                 model=model,
                 input_shape=input_shape,
                 num_actions=num_actions,
                 preprocessor=preprocessor,
-                memory=tfrl.core.ReplayMemory(max_size=500000, frame_height=84, frame_width=84, history_length=4),
+                memory=memory,
                 policy=policy,
                 gamma=0.99,
                 target_update_freq=5000,
@@ -197,30 +192,39 @@ def main():
                 checkpoint_dir=checkpoint_dir
             )
 
-            if args.checkpoint_file:
-                checkpoint_path = os.path.join(checkpoint_dir, args.checkpoint_file)
-                if os.path.exists(checkpoint_path):
-                    step = agent.load_checkpoint(checkpoint_path)
-                    args.start_step = step
-                    print(f"Resumed training from checkpoint: {checkpoint_path}")
-                else:
-                    print(f"Specified checkpoint not found: {checkpoint_path}")
-                    args.start_step = 0
-            elif args.start_step > 0:
-                latest_tf_checkpoint = tf.train.latest_checkpoint(checkpoint_dir)
-                if latest_tf_checkpoint:
-                    # Handle checkpoint filename format like 'checkpoint_100000-1'
-                    try:
-                        step = int(latest_tf_checkpoint.split('_')[-1].split('-')[0])
-                    except (ValueError, IndexError):
-                        print(f"Warning: Could not parse step from checkpoint: {latest_tf_checkpoint}")
-                        step = args.start_step
-                    agent.load_checkpoint(checkpoint_dir, step)
-                    args.start_step = step
-                    print(f"Resumed training from step {args.start_step}")
-                else:
-                    print(f"No checkpoint found, starting from beginning")
-                    args.start_step = 0
+            # Only load checkpoint on first iteration
+            if first_iteration:
+                if args.checkpoint_file:
+                    checkpoint_path = os.path.join(checkpoint_dir, args.checkpoint_file)
+                    if os.path.exists(checkpoint_path):
+                        step = agent.load_checkpoint(checkpoint_path)
+                        args.start_step = step
+                        # Update memory and policy references after loading
+                        memory = agent.memory
+                        policy = agent.policy
+                        print(f"Resumed training from checkpoint: {checkpoint_path}")
+                    else:
+                        print(f"Specified checkpoint not found: {checkpoint_path}")
+                        args.start_step = 0
+                elif args.start_step > 0:
+                    latest_tf_checkpoint = tf.train.latest_checkpoint(checkpoint_dir)
+                    if latest_tf_checkpoint:
+                        # Handle checkpoint filename format like 'checkpoint_100000-1'
+                        try:
+                            step = int(latest_tf_checkpoint.split('_')[-1].split('-')[0])
+                        except (ValueError, IndexError):
+                            print(f"Warning: Could not parse step from checkpoint: {latest_tf_checkpoint}")
+                            step = args.start_step
+                        agent.load_checkpoint(checkpoint_dir, step)
+                        args.start_step = step
+                        # Update memory and policy references after loading
+                        memory = agent.memory
+                        policy = agent.policy
+                        print(f"Resumed training from step {args.start_step}")
+                    else:
+                        print(f"No checkpoint found, starting from beginning")
+                        args.start_step = 0
+                first_iteration = False
 
             # Calculate the actual end step for this training session
             # fit() iterates from start_step to num_iterations, so we need:
@@ -228,7 +232,7 @@ def main():
             remaining_iterations = total_iterations - iterations_done
             end_step = args.start_step + remaining_iterations
             
-            evaluation_results, final_result = agent.fit(
+            fit_result = agent.fit(
                 env, 
                 num_iterations=end_step,
                 start_step=args.start_step,
@@ -237,19 +241,23 @@ def main():
                 checkpoint_freq=args.checkpoint_freq,
                 restart_freq=args.restart_freq
             )
+            
+            # fit() now always returns 3 values: (evaluation_results, final_result, stop_step)
+            evaluation_results, final_result, actual_stop_step = fit_result
 
             all_evaluation_results.extend(evaluation_results)
 
             if final_result is None:
-                # Check if evaluation_results is not empty before accessing
-                if evaluation_results:
-                    iterations_done += evaluation_results[-1][0] - args.start_step
-                    args.start_step = evaluation_results[-1][0]
-                    print(f"Restarting training from step {args.start_step}")
-                else:
-                    print("Warning: No evaluation results available for restart calculation")
-                    break
+                # Training was paused for restart
+                iterations_done += actual_stop_step - args.start_step
+                args.start_step = actual_stop_step
+                print(f"Restarting training from step {args.start_step}")
+                
+                # Reset environment for the next training session
+                env.close()
+                env = make_env(args.env, output_directory)
             else:
+                # Training completed
                 break
 
             del agent

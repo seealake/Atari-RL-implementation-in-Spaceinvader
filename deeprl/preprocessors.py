@@ -26,7 +26,6 @@ class HistoryPreprocessor(Preprocessor):
         """Initialize the HistoryPreprocessor with the desired history length."""
         self.history_length = history_length
         self.history = []
-        self.history_memory = []  # Separate history for memory (uint8)
 
     def process_state_for_network(self, state):
         """Returns a stack of the last `history_length` frames."""
@@ -37,20 +36,35 @@ class HistoryPreprocessor(Preprocessor):
         return np.stack(self.history, axis=-1)
 
     def process_state_for_memory(self, state):
-        """Returns a stack of the last `history_length` frames for memory storage."""
-        if len(self.history_memory) == 0:
-            self.history_memory = [np.zeros_like(state)] * self.history_length
-        self.history_memory.pop(0)
-        self.history_memory.append(state)
-        return np.stack(self.history_memory, axis=-1)
+        """Returns a stack of the last `history_length` frames for memory storage.
+        
+        Note: This uses the same history as process_state_for_network to maintain
+        consistency between network and memory states.
+        """
+        if len(self.history) == 0:
+            self.history = [np.zeros_like(state)] * self.history_length
+        # Don't modify history here - just return current stack
+        # The history is already updated by process_state_for_network
+        return np.stack(self.history, axis=-1)
 
     def reset(self):
         """Reset the history. Useful when starting a new episode."""
         self.history = []
-        self.history_memory = []
 
     def get_config(self):
         return {'history_length': self.history_length}
+
+    def save_state(self):
+        """Save the current history state for later restoration."""
+        import copy
+        return {
+            'history': copy.deepcopy(self.history)
+        }
+
+    def restore_state(self, state):
+        """Restore the history state from a saved state."""
+        import copy
+        self.history = copy.deepcopy(state['history'])
 
 
 class AtariPreprocessor(Preprocessor):
@@ -123,6 +137,14 @@ class AtariPreprocessor(Preprocessor):
         """Return configuration of the preprocessor."""
         return {'new_size': self.new_size}
 
+    def save_state(self):
+        """Save the current state. AtariPreprocessor is stateless, returns None."""
+        return None
+
+    def restore_state(self, state):
+        """Restore state. AtariPreprocessor is stateless, so this is a no-op."""
+        pass
+
 
 class PreprocessorSequence(Preprocessor):
     """A class to stack multiple preprocessors together.
@@ -173,3 +195,19 @@ class PreprocessorSequence(Preprocessor):
     def get_config(self):
         """Return configurations of all preprocessors."""
         return [preprocessor.get_config() for preprocessor in self.preprocessors]
+
+    def save_state(self):
+        """Save the state of all preprocessors."""
+        states = []
+        for preprocessor in self.preprocessors:
+            if hasattr(preprocessor, 'save_state'):
+                states.append(preprocessor.save_state())
+            else:
+                states.append(None)
+        return states
+
+    def restore_state(self, states):
+        """Restore the state of all preprocessors."""
+        for preprocessor, state in zip(self.preprocessors, states):
+            if state is not None and hasattr(preprocessor, 'restore_state'):
+                preprocessor.restore_state(state)

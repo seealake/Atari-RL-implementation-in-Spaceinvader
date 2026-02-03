@@ -9,6 +9,5 @@ pillow
 protobuf>=3.0
 pydot-ng
 scipy
-semver
 tensorflow>=2.0.0
 -e .

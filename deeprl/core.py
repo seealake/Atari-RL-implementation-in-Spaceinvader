@@ -81,26 +81,26 @@ class ReplayMemory:
         attempts = 0
         
         while len(valid_indices) < batch_size and attempts < max_attempts:
-            # Sample index for the 'next_state' frame (the frame after taking action)
-            idx = np.random.randint(self.history_length, max_index)
+            # Sample index for the state (the frame from which action was taken)
+            # We need idx and idx+1 to be valid, so sample from [history_length, max_index-1)
+            # idx must be >= history_length to ensure we have enough frames for the state stack
+            idx = np.random.randint(self.history_length, max_index - 1)
             attempts += 1
             
-            # Skip if state history crosses an episode boundary OR if the previous 
-            # transition ended the episode (making current transition invalid)
+            # Skip if state history crosses an episode boundary
             #
-            # state = frames[idx-history_length, ..., idx-2, idx-1]
-            # We check that:
-            # 1. dones[idx-history_length] to dones[idx-2] are all False 
+            # state s = frames[idx-history_length+1, ..., idx-1, idx]
+            # next_state s' = frames[idx-history_length+2, ..., idx, idx+1]
+            # 
+            # We need to check that:
+            # 1. dones[idx-history_length+1] to dones[idx-1] are all False 
             #    (so state stack doesn't cross episode boundaries)
-            # 2. dones[idx-1] is False 
-            #    (because if dones[idx-1]=True, frames[idx] is from a NEW episode,
-            #     and actions[idx] was chosen from the new episode's first state,
-            #     NOT from _get_state(idx-1) which is from the old episode)
+            # Note: dones[idx] can be True (terminal transition is valid)
             #
-            # We check dones at indices: idx-history_length, ..., idx-2, idx-1
-            # which corresponds to i in range(1, history_length+1) for check_idx = idx - i
+            # We check dones at indices: idx-history_length+1, ..., idx-1
+            # which corresponds to i in range(1, history_length) for check_idx = idx - i
             valid = True
-            for i in range(1, self.history_length + 1):
+            for i in range(1, self.history_length):
                 check_idx = (idx - i) % self.max_size
                 if self.dones[check_idx]:
                     valid = False
@@ -123,24 +123,15 @@ class ReplayMemory:
         indices = np.array(valid_indices)
         
         # Memory layout: at index i, we store:
-        # - frames[i]: the frame observed AFTER taking actions[i]
-        # - actions[i]: the action taken that led to frames[i]
+        # - frames[i]: the last frame of the state from which actions[i] was taken
+        # - actions[i]: the action taken from the state ending at frames[i]
         # - rewards[i]: the reward received for taking actions[i]
         # - dones[i]: whether the episode ended after taking actions[i]
-        #
-        # For a transition (s, a, r, s'):
-        # - state s = stack of frames ending at index (i-1)
-        # - action a = actions[i] (the action taken FROM state s that LED TO frames[i])
-        # - reward r = rewards[i] (the reward received for taking that action)
-        # - next_state s' = stack of frames ending at index i
-        # - done = dones[i] (whether the episode ended after taking the action)
-        #
-        # Note: We sample 'idx' which represents the next_state's last frame index
         
-        states = np.array([self._get_state(index - 1) for index in indices], dtype=np.float32) / 255.0
-        next_states = np.array([self._get_state(index) for index in indices], dtype=np.float32) / 255.0
+        states = np.array([self._get_state(index) for index in indices], dtype=np.float32) / 255.0
+        next_states = np.array([self._get_state(index + 1) for index in indices], dtype=np.float32) / 255.0
         
-        # Use index (not index-1) to get the action, reward, and done for the transition
+        # Use the sampled index directly to get the action, reward, and done for the transition
         actions = self.actions[indices]
         rewards = self.rewards[indices]
         dones = self.dones[indices].astype(np.float32)
@@ -148,11 +139,30 @@ class ReplayMemory:
         return states, actions, rewards, next_states, dones
 
     def _get_state(self, index):
-        """Get a state consisting of history_length consecutive frames ending at index."""
+        """Get a state consisting of history_length consecutive frames ending at index.
+        
+        Parameters
+        ----------
+        index: int
+            The index of the last frame in the state stack.
+            
+        Returns
+        -------
+        np.ndarray
+            A stack of history_length frames with shape (frame_height, frame_width, history_length).
+        """
+        # Wrap index to handle circular buffer
+        index = index % self.max_size
+        
         if index < self.history_length - 1:
-            # Not enough frames, pad with zeros or first frame
-            frames = [self.frames[0]] * (self.history_length - 1 - index)
-            frames.extend([self.frames[i % self.max_size] for i in range(index + 1)])
+            # Not enough frames before this index, pad with first frame or zeros
+            frames = []
+            for i in range(self.history_length):
+                frame_idx = index - (self.history_length - 1 - i)
+                if frame_idx < 0:
+                    frames.append(self.frames[0])  # Pad with first frame
+                else:
+                    frames.append(self.frames[frame_idx])
         else:
             frames = [self.frames[(index - self.history_length + 1 + i) % self.max_size] for i in range(self.history_length)]
         return np.stack(frames, axis=-1)

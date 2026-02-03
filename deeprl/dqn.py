@@ -114,6 +114,13 @@ class DQNAgent:
         state = self.preprocessor.process_state_for_network(state)
 
         evaluation_results = []
+        
+        # Synchronize policy step counter with training start_step
+        # This ensures epsilon decay is consistent when resuming training
+        if hasattr(self.policy, 'step'):
+            self.policy.step = start_step
+        elif hasattr(self.policy, 'current_step'):
+            self.policy.current_step = start_step
 
         for t in range(start_step, num_iterations):
             if t % 100 == 0: 
@@ -123,6 +130,9 @@ class DQNAgent:
                 current_epsilon = self.policy.epsilon_policy.epsilon
                 self.logger.info(f"Step {t}: Current epsilon: {current_epsilon:.4f}")
         
+            # Store the current state's last frame before taking action
+            frame_to_store = (state[:,:,-1] * 255).astype(np.uint8)
+            
             action = self.select_action(np.expand_dims(state, axis=0), is_training=True)
             # Handle both old and new Gym API for step()
             step_result = env.step(action)
@@ -133,16 +143,16 @@ class DQNAgent:
                 next_state, reward, done, _ = step_result  # Old Gym API
             next_state = self.preprocessor.process_state_for_network(next_state)
         
-            # Store the latest frame as uint8 (0-255) for memory efficiency
-            # next_state is float32 normalized (0-1), so multiply by 255 and convert to uint8
-            frame_to_store = (next_state[:,:,-1] * 255).astype(np.uint8)
+            # Store transition: frame from current state, action taken, reward received, done flag
+            # The memory stores: frame[i] is the last frame of state from which action[i] was taken
+            # reward[i] and done[i] are the results of taking action[i]
             self.memory.append(frame_to_store, action, reward, done)
             if t >= self.num_burn_in and t % self.train_freq == 0:
                 loss = self.update_policy()
                 if loss is not None:
                     self.record_loss(float(loss.numpy()) if hasattr(loss, 'numpy') else float(loss))
         
-            if t % checkpoint_freq == 0:
+            if t % checkpoint_freq == 0 and t > 0:
                 self.save_checkpoint(t, evaluation_results)
         
             state = next_state
@@ -165,8 +175,30 @@ class DQNAgent:
                 gc.collect()
                 self.logger.info(f"Step {t}: Garbage collection performed")
                 self.save_model(f'checkpoint_model_{t}')
-                self.logger.info(f"Model checkpoint saved at step {t}")       
+                self.logger.info(f"Model checkpoint saved at step {t}")
+                
+                # Save preprocessor state before evaluation
+                saved_preprocessor_state = None
+                if hasattr(self.preprocessor, 'save_state'):
+                    saved_preprocessor_state = self.preprocessor.save_state()
+                
                 mean_reward, std_reward = self.evaluate(env, num_episodes=10)
+                
+                # Restore preprocessor state after evaluation
+                if saved_preprocessor_state is not None and hasattr(self.preprocessor, 'restore_state'):
+                    self.preprocessor.restore_state(saved_preprocessor_state)
+                
+                # After evaluation, the environment is in an unknown state.
+                # We need to reset and rebuild the state to continue training.
+                # Note: This means we lose the current episode progress, but ensures consistency.
+                reset_result = env.reset()
+                if isinstance(reset_result, tuple):
+                    state, _ = reset_result
+                else:
+                    state = reset_result
+                self.preprocessor.reset()
+                state = self.preprocessor.process_state_for_network(state)
+                
                 evaluation_results.append((t, mean_reward, std_reward))
                 self.logger.info(f"Step {t}: Mean reward: {mean_reward:.2f} +/- {std_reward:.2f}")
                 if len(self.losses) > 0:
@@ -179,19 +211,22 @@ class DQNAgent:
             if t > start_step and t % restart_freq == 0:
                 self.save_checkpoint(t, evaluation_results)
                 self.logger.info(f"Training paused at step {t} for potential restart")
-                return evaluation_results, None  
+                return evaluation_results, None, t  
         final_mean_reward, final_std_reward = self.evaluate(env, num_episodes=100)
         self.plot_smoothed_losses()
         self.logger.info(f"Final evaluation - Mean reward: {final_mean_reward:.2f} +/- {final_std_reward:.2f}")
         self.save_model(f'final_model_{num_iterations}')
         self.logger.info(f"Final model saved after {num_iterations} iterations")
-        return evaluation_results, (final_mean_reward, final_std_reward)
+        # Always return 3 values for consistent interface: (evaluation_results, final_result, stop_step)
+        return evaluation_results, (final_mean_reward, final_std_reward), num_iterations
 
 
     def select_action(self, state, is_training=True):
         q_values = self.q_network.predict(state, verbose=0)
         if is_training:
-            return self.policy.select_action(q_values)
+            action = self.policy.select_action(q_values)
+            # Ensure action is a Python int, not numpy int (for gym compatibility)
+            return int(action)
         else:
             # Flatten q_values if it's 2D (batch_size=1, num_actions)
             if q_values.ndim > 1:

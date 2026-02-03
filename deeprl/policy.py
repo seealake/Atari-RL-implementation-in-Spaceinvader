@@ -107,13 +107,18 @@ class GreedyEpsilonPolicy(Policy):
         int:
           The action index chosen.
         """
-        q_values = np.atleast_2d(q_values)
-        num_actions = q_values.shape[-1]
+        # Convert to numpy array if needed
+        q_values = np.asarray(q_values)
+        
+        # Handle 2D case (batch_size, num_actions) - use first row
+        if q_values.ndim == 2:
+            q_values = q_values[0]
+        
+        num_actions = q_values.shape[0]
         if np.random.rand() < self.epsilon:
             return int(np.random.randint(0, num_actions))
         else:
-            # Flatten to 1D if needed before argmax to get correct action index
-            return int(np.argmax(q_values.flatten()[:num_actions]))
+            return int(np.argmax(q_values))
 
     def get_config(self):
         return {'epsilon': self.epsilon}

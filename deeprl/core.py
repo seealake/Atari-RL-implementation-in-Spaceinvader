@@ -1,7 +1,5 @@
 """Core classes."""
 
-from collections import deque
-import random
 import numpy as np
 from PIL import Image
 
@@ -54,7 +52,7 @@ class ReplayMemory:
         self.frame_width = frame_width
         self.history_length = history_length
         self.frames = np.zeros((max_size, frame_height, frame_width), dtype=np.uint8)
-        self.actions = np.zeros(max_size, dtype=np.int8)
+        self.actions = np.zeros(max_size, dtype=np.int32)  # Use int32 to support larger action spaces
         self.rewards = np.zeros(max_size, dtype=np.float32)
         self.dones = np.zeros(max_size, dtype=bool)       
         self.current = 0
@@ -71,23 +69,112 @@ class ReplayMemory:
 
     def sample(self, batch_size):
         max_index = min(self.count, self.max_size)
-        indices = np.random.randint(self.history_length, max_index, size=batch_size)
         
-        states = np.array([self._get_state(index - 1) for index in indices], dtype=np.float32) / 255.0
-        next_states = np.array([self._get_state(index) for index in indices], dtype=np.float32) / 255.0
+        # Need at least history_length + 2 frames to sample:
+        # - history_length frames for the current state
+        # - 1 frame for the next state's last frame (index + 1)
+        # - So we need indices from [history_length, max_index-1), which requires max_index > history_length + 1
+        if max_index <= self.history_length + 1:
+            raise ValueError(f"Not enough samples in memory. Have {max_index}, need at least {self.history_length + 2}")
         
+        # Ensure we don't sample from indices that would wrap around incorrectly
+        # or sample terminal states as the "current" state
+        valid_indices = []
+        max_attempts = batch_size * 10  # Prevent infinite loop
+        attempts = 0
+        
+        while len(valid_indices) < batch_size and attempts < max_attempts:
+            # Sample index for the state (the frame from which action was taken)
+            # We need idx and idx+1 to be valid, so sample from [history_length, max_index-1)
+            # idx must be >= history_length to ensure we have enough frames for the state stack
+            idx = np.random.randint(self.history_length, max_index - 1)
+            attempts += 1
+            
+            # Skip if state history crosses an episode boundary
+            #
+            # state s = frames[idx-history_length+1, ..., idx-1, idx]
+            # next_state s' = frames[idx-history_length+2, ..., idx, idx+1]
+            # 
+            # We need to check that:
+            # 1. dones[idx-history_length+1] to dones[idx-1] are all False 
+            #    (so state stack doesn't cross episode boundaries)
+            # Note: dones[idx] can be True (terminal transition is valid)
+            #
+            # We check dones at indices: idx-history_length+1, ..., idx-1
+            # which corresponds to i in range(1, history_length) for check_idx = idx - i
+            valid = True
+            for i in range(1, self.history_length):
+                check_idx = (idx - i) % self.max_size
+                if self.dones[check_idx]:
+                    valid = False
+                    break
+            
+            # Also avoid sampling the current write position if buffer is full
+            if self.count >= self.max_size:
+                if abs(idx - self.current) < self.history_length + 1:
+                    valid = False
+            
+            if valid:
+                valid_indices.append(idx)
+        
+        # If we couldn't find enough valid samples, fall back to random sampling
+        if len(valid_indices) < batch_size:
+            remaining = batch_size - len(valid_indices)
+            fallback_indices = np.random.randint(self.history_length, max_index - 1, size=remaining)
+            valid_indices.extend(fallback_indices.tolist())
+        
+        indices = np.array(valid_indices)
+        
+        # Memory layout: at index i, we store:
+        # - frames[i]: the last frame of the state from which actions[i] was taken
+        # - actions[i]: the action taken from the state ending at frames[i]
+        # - rewards[i]: the reward received for taking actions[i]
+        # - dones[i]: whether the episode ended after taking actions[i]
+        
+        states = np.array([self._get_state(index) for index in indices], dtype=np.float32) / 255.0
+        
+        # For terminal states, next_state doesn't matter (Q-value is 0)
+        # But we still need to provide a valid next_state array
+        # For non-terminal states, get the actual next state
+        next_states = np.array([self._get_state(index + 1) for index in indices], dtype=np.float32) / 255.0
+        
+        # Use the sampled index directly to get the action, reward, and done for the transition
         actions = self.actions[indices]
         rewards = self.rewards[indices]
-        dones = self.dones[indices]
+        dones = self.dones[indices].astype(np.float32)
         
         return states, actions, rewards, next_states, dones
 
     def _get_state(self, index):
-        if index < self.history_length - 1:
-            frames = [self.frames[0]] * (self.history_length - 1 - index)
-            frames.extend([self.frames[i % self.count] for i in range(index + 1)])
+        """Get a state consisting of history_length consecutive frames ending at index.
+        
+        Parameters
+        ----------
+        index: int
+            The index of the last frame in the state stack.
+            
+        Returns
+        -------
+        np.ndarray
+            A stack of history_length frames with shape (frame_height, frame_width, history_length).
+        """
+        # Wrap index to handle circular buffer
+        index = index % self.max_size
+        
+        # When buffer is full, we can always use circular indexing
+        # When buffer is not full, we need to handle the case where index < history_length - 1
+        if self.count < self.max_size and index < self.history_length - 1:
+            # Buffer not full and not enough frames before this index, pad with first frame
+            frames = []
+            for i in range(self.history_length):
+                frame_idx = index - (self.history_length - 1 - i)
+                if frame_idx < 0:
+                    frames.append(self.frames[0])  # Pad with first frame
+                else:
+                    frames.append(self.frames[frame_idx])
         else:
-            frames = [self.frames[i % self.count] for i in range(index - self.history_length + 1, index + 1)]
+            # Buffer is full or we have enough frames, use circular indexing
+            frames = [self.frames[(index - self.history_length + 1 + i) % self.max_size] for i in range(self.history_length)]
         return np.stack(frames, axis=-1)
 
     def __len__(self):

@@ -1,44 +1,10 @@
 """Common functions you may find useful in your implementation."""
 
-import semver
 import tensorflow as tf
-
-def get_uninitialized_variables(variables=None):
-    """Return a list of uninitialized tf variables for TensorFlow 2.x.
-
-    Parameters
-    ----------
-    variables: tf.Variable, list(tf.Variable), optional
-      Filter variable list to only those that are uninitialized. If no
-      variables are specified the list of all variables in the graph
-      will be used.
-
-    Returns
-    -------
-    list(tf.Variable)
-      List of uninitialized tf variables.
-    """
-    if variables is None:
-        try:
-            variables = tf.compat.v1.global_variables()
-        except AttributeError:
-            print("Warning: tf.compat.v1.global_variables() is not available. Using tf.global_variables() instead.")
-            variables = tf.global_variables()
-
-    uninitialized = []
-    for var in variables:
-        try:
-            tf.assert_variables_initialized([var])
-        except tf.errors.FailedPreconditionError:
-            uninitialized.append(var)
-        except Exception as e:
-            print(f"Warning: Unexpected error when checking initialization of variable {var.name}: {e}")
-
-    return uninitialized
 
 
 def get_soft_target_model_updates(target, source, tau):
-    r"""Return list of target model update ops using soft update.
+    r"""Perform soft update of target network weights.
 
     The update is of the form:
 
@@ -54,18 +20,13 @@ def get_soft_target_model_updates(target, source, tau):
     tau: float
       The weight of the source weights to the target weights used
       during update.
-
-    Returns
-    -------
-    list(tf.Tensor)
-      List of TensorFlow update operations.
     """
     for target_var, source_var in zip(target.trainable_variables, source.trainable_variables):
         target_var.assign((1. - tau) * target_var + tau * source_var)
 
 
 def get_hard_target_model_updates(target, source):
-    """Return list of target model update ops using hard update.
+    """Perform hard update of target network weights.
 
     The source weights are copied directly to the target network.
 
@@ -75,18 +36,21 @@ def get_hard_target_model_updates(target, source):
       The target model. Should have the same architecture as source model.
     source: keras.models.Model
       The source model. Should have the same architecture as target model.
-
-    Returns
-    -------
-    list(tf.Tensor)
-      List of TensorFlow update operations.
     """
     for target_var, source_var in zip(target.trainable_variables, source.trainable_variables):
         target_var.assign(source_var)
 
 
 def check_tensorflow_version():
-    """Check that TensorFlow version is compatible (>=2.0.0)."""
+    """Check that TensorFlow version is compatible (>=2.0.0).
+    
+    Returns
+    -------
+    bool
+        True if TensorFlow version is >= 2.0.0, raises RuntimeError otherwise.
+    """
     tf_version = tf.__version__
-    if not semver.match(tf_version, ">=2.0.0"):
+    major_version = int(tf_version.split('.')[0])
+    if major_version < 2:
         raise RuntimeError(f"TensorFlow version {tf_version} is not supported. Please use TensorFlow >= 2.0.0.")
+    return True

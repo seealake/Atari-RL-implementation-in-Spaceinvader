@@ -1,6 +1,6 @@
 #!/usr/bin/env python
-"""Yes. Run Atari Environment with DQN."""
-"""LINEAR, DQN, DOUBLE DQN, DUELING DQN"""
+"""Run Atari Environment with DQN."""
+"""Supports: LINEAR, DQN, DOUBLE DQN, DUELING DQN"""
 import argparse
 import os
 import random
@@ -10,8 +10,7 @@ import gym
 from gym.wrappers import RecordVideo
 import deeprl as tfrl
 from deeprl.dqn import DQNAgent
-from deeprl.objectives import mean_huber_loss
-from deeprl.policy import LinearDecayGreedyEpsilonPolicy, GreedyEpsilonPolicy, ExponentialDecayGreedyEpsilonPolicy
+from deeprl.policy import GreedyEpsilonPolicy, ExponentialDecayGreedyEpsilonPolicy
 from deeprl.preprocessors import AtariPreprocessor, HistoryPreprocessor, PreprocessorSequence
 import matplotlib.pyplot as plt
 import gc
@@ -26,13 +25,8 @@ if gpus:
         print(f"Error enabling GPU memory growth: {e}")
 
 def create_optimizer():
-    return tf.keras.optimizers.RMSprop(
-        learning_rate=1e-4,
-        rho=0.95,
-        momentum=0.0,
-        epsilon=0.00001,
-        centered=True
-    )
+    """Create Adam optimizer with standard learning rate."""
+    return tf.keras.optimizers.Adam(learning_rate=3e-4)
 
 def create_linear_model(input_shape, num_actions, model_name='linear_q_network'):
     """Create a linear Q-network."""
@@ -44,6 +38,7 @@ def create_linear_model(input_shape, num_actions, model_name='linear_q_network')
     return model
 
 def create_deep_q_network(input_shape, num_actions, model_name='deep_q_network'):
+    """Create a deep Q-network with CNN architecture."""
     inputs = tf.keras.Input(shape=(input_shape[0], input_shape[1], input_shape[2]))
     x = tf.keras.layers.Conv2D(32, (8, 8), strides=4, activation='relu')(inputs)
     x = tf.keras.layers.Conv2D(64, (4, 4), strides=2, activation='relu')(x)
@@ -53,12 +48,7 @@ def create_deep_q_network(input_shape, num_actions, model_name='deep_q_network')
     x = tf.keras.layers.Dense(512, activation='relu')(x)  
     outputs = tf.keras.layers.Dense(num_actions, activation=None)(x)
     model = tf.keras.Model(inputs=inputs, outputs=outputs, name=model_name)
-    optimizer = tf.keras.optimizers.RMSprop(
-        learning_rate=0.00025, 
-        rho=0.95,
-        epsilon=0.01
-    )
-    model.compile(optimizer=optimizer, loss='huber') 
+    model.compile(optimizer=create_optimizer(), loss='huber') 
     return model
 
 def create_dueling_q_network(input_shape, num_actions, model_name='dueling_q_network'):
@@ -74,17 +64,22 @@ def create_dueling_q_network(input_shape, num_actions, model_name='dueling_q_net
     advantage = tf.keras.layers.Dense(num_actions)(advantage_stream)
     q_values = value + (advantage - tf.reduce_mean(advantage, axis=1, keepdims=True))
     model = tf.keras.Model(inputs=inputs, outputs=q_values, name=model_name)
-    optimizer = tf.keras.optimizers.RMSprop(learning_rate=0.00025, rho=0.95, epsilon=0.01)    
-    model.compile(optimizer=optimizer, loss='mse')
+    model.compile(optimizer=create_optimizer(), loss='huber')
     return model
 
-def make_env(env_name, output_directory):
-    env = gym.make(env_name)
-    env = RecordVideo(env, video_folder=output_directory, episode_trigger=lambda x: True)
+def make_env(env_name, output_directory, record_video=True):
+    os.makedirs(output_directory, exist_ok=True)
+    # Use render_mode='rgb_array' for video recording compatibility
+    env = gym.make(env_name, render_mode='rgb_array')
+    if record_video:
+        env = RecordVideo(env, video_folder=output_directory, episode_trigger=lambda x: x % 100 == 0)
     return env
 
 def get_output_folder(parent_dir, env_name):
     """Return save folder."""
+    # Sanitize env_name to be a valid folder name (replace slashes with underscores)
+    safe_env_name = env_name.replace('/', '_').replace('\\', '_')
+    
     os.makedirs(parent_dir, exist_ok=True)
     experiment_id = 0
     for folder_name in os.listdir(parent_dir):
@@ -98,11 +93,15 @@ def get_output_folder(parent_dir, env_name):
             pass
     experiment_id += 1
 
-    parent_dir = os.path.join(parent_dir, env_name)
+    parent_dir = os.path.join(parent_dir, safe_env_name)
     parent_dir = parent_dir + '-run{}'.format(experiment_id)
     return parent_dir
 
 def plot_learning_curve(evaluation_results, output_dir, mode):
+    if not evaluation_results:
+        print("No evaluation results to plot")
+        return
+    
     steps, means, stds = zip(*evaluation_results)
     plt.figure(figsize=(10, 6))
     plt.plot(steps, means)
@@ -110,6 +109,7 @@ def plot_learning_curve(evaluation_results, output_dir, mode):
     plt.title(f'Learning Curve for {mode.capitalize()} Q-Network')
     plt.xlabel('Steps')
     plt.ylabel('Mean Reward')
+    os.makedirs(output_dir, exist_ok=True)
     plt.savefig(os.path.join(output_dir, f'{mode}_learning_curve.png'))
     plt.close()
 
@@ -124,7 +124,7 @@ def create_final_evaluation_table(results):
 def main():
     try:
         parser = argparse.ArgumentParser(description='Run DQN on Atari Space Invaders')
-        parser.add_argument('--env', default='SpaceInvaders-v0', help='Atari env name')
+        parser.add_argument('--env', default='ALE/SpaceInvaders-v5', help='Atari env name')
         parser.add_argument('-o', '--output', default='atari-v0', help='Directory to save data to')
         parser.add_argument('--seed', default=0, type=int, help='Random seed')
         parser.add_argument('--mode', required=True, choices=['linear', 'linear_double', 'deep', 'double', 'dueling'],
@@ -151,6 +151,18 @@ def main():
         total_iterations = args.iterations
         iterations_done = 0
         all_evaluation_results = []
+        
+        # Create policy and memory outside the loop to preserve state across restarts
+        policy = ExponentialDecayGreedyEpsilonPolicy(
+            GreedyEpsilonPolicy(1.0),
+            start_value=1.0,
+            end_value=0.05,
+            decay_rate=1e-5
+        )
+        memory = tfrl.core.ReplayMemory(max_size=500000, frame_height=84, frame_width=84, history_length=4)
+        
+        # Flag to track if this is the first iteration (for checkpoint loading)
+        first_iteration = True
 
         while iterations_done < total_iterations:
             if args.mode == 'linear' or args.mode == 'linear_double':
@@ -163,20 +175,13 @@ def main():
             atari_preprocessor = AtariPreprocessor(new_size=(84, 84))
             history_preprocessor = HistoryPreprocessor(history_length=4)
             preprocessor = PreprocessorSequence([atari_preprocessor, history_preprocessor])
-            
-            policy = ExponentialDecayGreedyEpsilonPolicy(
-                GreedyEpsilonPolicy(1.0),
-                start_value=1.0,
-                end_value=0.05,
-                decay_rate=1e-5
-            )
 
             agent = DQNAgent(
                 model=model,
                 input_shape=input_shape,
                 num_actions=num_actions,
                 preprocessor=preprocessor,
-                memory=tfrl.core.ReplayMemory(max_size=500000, frame_height=84, frame_width=84, history_length=4),
+                memory=memory,
                 policy=policy,
                 gamma=0.99,
                 target_update_freq=5000,
@@ -189,43 +194,76 @@ def main():
                 checkpoint_dir=checkpoint_dir
             )
 
-            if args.checkpoint_file:
-                checkpoint_path = os.path.join(args.checkpoint_dir, args.checkpoint_file)
-                if os.path.exists(checkpoint_path):
-                    step = agent.load_checkpoint(checkpoint_path)
-                    args.start_step = step
-                    print(f"Resumed training from checkpoint: {checkpoint_path}")
-                else:
-                    print(f"Specified checkpoint not found: {checkpoint_path}")
-                    args.start_step = 0
-            elif args.start_step > 0:
-                latest_tf_checkpoint = tf.train.latest_checkpoint(args.checkpoint_dir)
-                if latest_tf_checkpoint:
-                    step = int(latest_tf_checkpoint.split('_')[-1])
-                    agent.load_checkpoint(args.checkpoint_dir, step)
-                    args.start_step = step
-                    print(f"Resumed training from step {args.start_step}")
-                else:
-                    print(f"No checkpoint found, starting from beginning")
-                    args.start_step = 0
+            # Only load checkpoint on first iteration
+            if first_iteration:
+                # Ensure checkpoint directory exists before trying to load
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                
+                if args.checkpoint_file:
+                    checkpoint_path = os.path.join(checkpoint_dir, args.checkpoint_file)
+                    if os.path.exists(checkpoint_path):
+                        step = agent.load_checkpoint(checkpoint_path)
+                        args.start_step = step
+                        # Update memory and policy references after loading
+                        memory = agent.memory
+                        policy = agent.policy
+                        print(f"Resumed training from checkpoint: {checkpoint_path}")
+                    else:
+                        print(f"Specified checkpoint not found: {checkpoint_path}")
+                        args.start_step = 0
+                elif args.start_step > 0:
+                    # Try to find and load the latest checkpoint
+                    latest_tf_checkpoint = tf.train.latest_checkpoint(checkpoint_dir)
+                    if latest_tf_checkpoint:
+                        # Handle checkpoint filename format like 'checkpoint_100000-1'
+                        try:
+                            step = int(latest_tf_checkpoint.split('_')[-1].split('-')[0])
+                        except (ValueError, IndexError):
+                            print(f"Warning: Could not parse step from checkpoint: {latest_tf_checkpoint}")
+                            step = args.start_step
+                        agent.load_checkpoint(checkpoint_dir, step)
+                        args.start_step = step
+                        # Update memory and policy references after loading
+                        memory = agent.memory
+                        policy = agent.policy
+                        print(f"Resumed training from step {args.start_step}")
+                    else:
+                        print(f"No checkpoint found in {checkpoint_dir}, starting from beginning")
+                        args.start_step = 0
+                first_iteration = False
 
-            evaluation_results, final_result = agent.fit(
+            # Calculate the actual end step for this training session
+            # fit() iterates from start_step to num_iterations, so we need:
+            # end_step = start_step + remaining_iterations
+            remaining_iterations = total_iterations - iterations_done
+            end_step = args.start_step + remaining_iterations
+            
+            fit_result = agent.fit(
                 env, 
-                num_iterations=total_iterations - iterations_done,
+                num_iterations=end_step,
                 start_step=args.start_step,
                 max_episode_length=None,
                 checkpoint_dir=checkpoint_dir,
                 checkpoint_freq=args.checkpoint_freq,
                 restart_freq=args.restart_freq
             )
+            
+            # fit() now always returns 3 values: (evaluation_results, final_result, stop_step)
+            evaluation_results, final_result, actual_stop_step = fit_result
 
             all_evaluation_results.extend(evaluation_results)
 
             if final_result is None:
-                iterations_done += evaluation_results[-1][0] - args.start_step
-                args.start_step = evaluation_results[-1][0]
+                # Training was paused for restart
+                iterations_done += actual_stop_step - args.start_step
+                args.start_step = actual_stop_step
                 print(f"Restarting training from step {args.start_step}")
+                
+                # Reset environment for the next training session
+                env.close()
+                env = make_env(args.env, output_directory)
             else:
+                # Training completed
                 break
 
             del agent
@@ -239,10 +277,8 @@ def main():
             print(f"Final Result for {args.mode} Q-network:")
             print(f"Mean Reward: {final_mean_reward:.2f} +/- {final_std_reward:.2f}")
             
-            model_save_path = os.path.join(output_dir, 'final_saved_model')
-            tf.keras.models.save_model(agent.q_network, model_save_path)
-            print(f"Final model saved to {model_save_path}")
-            
+            # Note: 'agent' might have been deleted in the loop, so we need to check
+            # The final model should be saved inside the fit() method
             with open(os.path.join(output_dir, 'final_results.txt'), 'w') as f:
                 f.write(f"Mode: {args.mode}\n")
                 f.write(f"Final Mean Reward: {final_mean_reward:.2f}\n")

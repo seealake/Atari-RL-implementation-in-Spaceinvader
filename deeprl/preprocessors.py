@@ -3,7 +3,6 @@
 import numpy as np
 from PIL import Image
 
-from deeprl import utils
 from deeprl.core import Preprocessor
 
 
@@ -31,9 +30,23 @@ class HistoryPreprocessor(Preprocessor):
     def process_state_for_network(self, state):
         """Returns a stack of the last `history_length` frames."""
         if len(self.history) == 0:
-            self.history = [np.zeros_like(state)] * self.history_length
+            # Initialize history with zeros of the same shape as the input state
+            self.history = [np.zeros_like(state) for _ in range(self.history_length)]
         self.history.pop(0)
-        self.history.append(state)
+        # Make a copy of state to avoid reference issues
+        self.history.append(state.copy() if hasattr(state, 'copy') else state)
+        return np.stack(self.history, axis=-1)
+
+    def process_state_for_memory(self, state):
+        """Returns a stack of the last `history_length` frames for memory storage.
+        
+        Note: This uses the same history as process_state_for_network to maintain
+        consistency between network and memory states.
+        """
+        if len(self.history) == 0:
+            self.history = [np.zeros_like(state)] * self.history_length
+        # Don't modify history here - just return current stack
+        # The history is already updated by process_state_for_network
         return np.stack(self.history, axis=-1)
 
     def reset(self):
@@ -42,6 +55,18 @@ class HistoryPreprocessor(Preprocessor):
 
     def get_config(self):
         return {'history_length': self.history_length}
+
+    def save_state(self):
+        """Save the current history state for later restoration."""
+        import copy
+        return {
+            'history': copy.deepcopy(self.history)
+        }
+
+    def restore_state(self, state):
+        """Restore the history state from a saved state."""
+        import copy
+        self.history = copy.deepcopy(state['history'])
 
 
 class AtariPreprocessor(Preprocessor):
@@ -93,7 +118,7 @@ class AtariPreprocessor(Preprocessor):
 
     def _preprocess_frame(self, frame):
         """Convert the frame to greyscale and resize it."""
-        frame = np.mean(frame, axis=2)  # Convert to greyscale
+        frame = np.mean(frame, axis=2).astype(np.uint8)  # Convert to greyscale, must be uint8 for PIL
         frame = Image.fromarray(frame)
         frame = frame.resize(self.new_size)
         return np.array(frame)
@@ -105,6 +130,22 @@ class AtariPreprocessor(Preprocessor):
     def process_reward(self, reward):
         """Clip the reward between -1 and 1."""
         return np.clip(reward, -1, 1)
+
+    def reset(self):
+        """Reset internal state. AtariPreprocessor is stateless, so this is a no-op."""
+        pass
+
+    def get_config(self):
+        """Return configuration of the preprocessor."""
+        return {'new_size': self.new_size}
+
+    def save_state(self):
+        """Save the current state. AtariPreprocessor is stateless, returns None."""
+        return None
+
+    def restore_state(self, state):
+        """Restore state. AtariPreprocessor is stateless, so this is a no-op."""
+        pass
 
 
 class PreprocessorSequence(Preprocessor):
@@ -156,3 +197,19 @@ class PreprocessorSequence(Preprocessor):
     def get_config(self):
         """Return configurations of all preprocessors."""
         return [preprocessor.get_config() for preprocessor in self.preprocessors]
+
+    def save_state(self):
+        """Save the state of all preprocessors."""
+        states = []
+        for preprocessor in self.preprocessors:
+            if hasattr(preprocessor, 'save_state'):
+                states.append(preprocessor.save_state())
+            else:
+                states.append(None)
+        return states
+
+    def restore_state(self, states):
+        """Restore the state of all preprocessors."""
+        for preprocessor, state in zip(self.preprocessors, states):
+            if state is not None and hasattr(preprocessor, 'restore_state'):
+                preprocessor.restore_state(state)

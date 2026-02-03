@@ -52,7 +52,7 @@ class ReplayMemory:
         self.frame_width = frame_width
         self.history_length = history_length
         self.frames = np.zeros((max_size, frame_height, frame_width), dtype=np.uint8)
-        self.actions = np.zeros(max_size, dtype=np.int8)
+        self.actions = np.zeros(max_size, dtype=np.int32)  # Use int32 to support larger action spaces
         self.rewards = np.zeros(max_size, dtype=np.float32)
         self.dones = np.zeros(max_size, dtype=bool)       
         self.current = 0
@@ -70,9 +70,12 @@ class ReplayMemory:
     def sample(self, batch_size):
         max_index = min(self.count, self.max_size)
         
-        # Need at least history_length + 1 frames to sample (for state and next_state)
-        if max_index <= self.history_length:
-            raise ValueError(f"Not enough samples in memory. Have {max_index}, need at least {self.history_length + 1}")
+        # Need at least history_length + 2 frames to sample:
+        # - history_length frames for the current state
+        # - 1 frame for the next state's last frame (index + 1)
+        # - So we need indices from [history_length, max_index-1), which requires max_index > history_length + 1
+        if max_index <= self.history_length + 1:
+            raise ValueError(f"Not enough samples in memory. Have {max_index}, need at least {self.history_length + 2}")
         
         # Ensure we don't sample from indices that would wrap around incorrectly
         # or sample terminal states as the "current" state
@@ -117,7 +120,7 @@ class ReplayMemory:
         # If we couldn't find enough valid samples, fall back to random sampling
         if len(valid_indices) < batch_size:
             remaining = batch_size - len(valid_indices)
-            fallback_indices = np.random.randint(self.history_length, max_index, size=remaining)
+            fallback_indices = np.random.randint(self.history_length, max_index - 1, size=remaining)
             valid_indices.extend(fallback_indices.tolist())
         
         indices = np.array(valid_indices)
@@ -129,6 +132,10 @@ class ReplayMemory:
         # - dones[i]: whether the episode ended after taking actions[i]
         
         states = np.array([self._get_state(index) for index in indices], dtype=np.float32) / 255.0
+        
+        # For terminal states, next_state doesn't matter (Q-value is 0)
+        # But we still need to provide a valid next_state array
+        # For non-terminal states, get the actual next state
         next_states = np.array([self._get_state(index + 1) for index in indices], dtype=np.float32) / 255.0
         
         # Use the sampled index directly to get the action, reward, and done for the transition
@@ -154,8 +161,10 @@ class ReplayMemory:
         # Wrap index to handle circular buffer
         index = index % self.max_size
         
-        if index < self.history_length - 1:
-            # Not enough frames before this index, pad with first frame or zeros
+        # When buffer is full, we can always use circular indexing
+        # When buffer is not full, we need to handle the case where index < history_length - 1
+        if self.count < self.max_size and index < self.history_length - 1:
+            # Buffer not full and not enough frames before this index, pad with first frame
             frames = []
             for i in range(self.history_length):
                 frame_idx = index - (self.history_length - 1 - i)
@@ -164,6 +173,7 @@ class ReplayMemory:
                 else:
                     frames.append(self.frames[frame_idx])
         else:
+            # Buffer is full or we have enough frames, use circular indexing
             frames = [self.frames[(index - self.history_length + 1 + i) % self.max_size] for i in range(self.history_length)]
         return np.stack(frames, axis=-1)
 

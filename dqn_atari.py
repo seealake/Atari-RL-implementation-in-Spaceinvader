@@ -67,10 +67,12 @@ def create_dueling_q_network(input_shape, num_actions, model_name='dueling_q_net
     model.compile(optimizer=create_optimizer(), loss='huber')
     return model
 
-def make_env(env_name, output_directory):
+def make_env(env_name, output_directory, record_video=True):
     os.makedirs(output_directory, exist_ok=True)
-    env = gym.make(env_name)
-    env = RecordVideo(env, video_folder=output_directory, episode_trigger=lambda x: True)
+    # Use render_mode='rgb_array' for video recording compatibility
+    env = gym.make(env_name, render_mode='rgb_array')
+    if record_video:
+        env = RecordVideo(env, video_folder=output_directory, episode_trigger=lambda x: x % 100 == 0)
     return env
 
 def get_output_folder(parent_dir, env_name):
@@ -194,6 +196,9 @@ def main():
 
             # Only load checkpoint on first iteration
             if first_iteration:
+                # Ensure checkpoint directory exists before trying to load
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                
                 if args.checkpoint_file:
                     checkpoint_path = os.path.join(checkpoint_dir, args.checkpoint_file)
                     if os.path.exists(checkpoint_path):
@@ -207,6 +212,7 @@ def main():
                         print(f"Specified checkpoint not found: {checkpoint_path}")
                         args.start_step = 0
                 elif args.start_step > 0:
+                    # Try to find and load the latest checkpoint
                     latest_tf_checkpoint = tf.train.latest_checkpoint(checkpoint_dir)
                     if latest_tf_checkpoint:
                         # Handle checkpoint filename format like 'checkpoint_100000-1'
@@ -222,7 +228,7 @@ def main():
                         policy = agent.policy
                         print(f"Resumed training from step {args.start_step}")
                     else:
-                        print(f"No checkpoint found, starting from beginning")
+                        print(f"No checkpoint found in {checkpoint_dir}, starting from beginning")
                         args.start_step = 0
                 first_iteration = False
 

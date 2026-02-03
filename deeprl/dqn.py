@@ -55,8 +55,9 @@ class DQNAgent:
         self.logger.info("DQNAgent initialized")
 
     def update_policy(self):
-        # Need enough samples for both batch_size and history_length requirements
-        min_samples_needed = max(self.batch_size, self.memory.history_length + 1)
+        # Need enough samples for both batch_size and memory sampling requirements
+        # Memory.sample requires at least history_length + 2 samples
+        min_samples_needed = max(self.batch_size, self.memory.history_length + 2)
         if len(self.memory) < min_samples_needed:
             return None
 
@@ -76,6 +77,9 @@ class DQNAgent:
         else:
             # Standard DQN: use target network to select actions
             next_actions = tf.argmax(target_q_values_next, axis=1)
+        
+        # Cast next_actions to int32 for one_hot compatibility
+        next_actions = tf.cast(next_actions, tf.int32)
         
         # Compute target values and stop gradient to prevent backpropagation
         target_values = rewards + self.gamma * tf.reduce_sum(
@@ -171,7 +175,7 @@ class DQNAgent:
                 self.soft_update_target_network()
                 self.logger.info(f"Target network updated at step {t}")
         
-            if t % 10000 == 0:  
+            if t % 10000 == 0 and t > 0:  
                 gc.collect()
                 self.logger.info(f"Step {t}: Garbage collection performed")
                 self.save_model(f'checkpoint_model_{t}')
@@ -285,7 +289,8 @@ class DQNAgent:
             'step': step,
             'memory': self.memory,
             'policy_state': self.policy.get_config() if hasattr(self.policy, 'get_config') else None,
-            'evaluation_results': evaluation_results
+            'evaluation_results': evaluation_results,
+            'losses': self.losses  # Save losses for plotting after resuming
         }
         with open(os.path.join(self.checkpoint_dir, f'extra_data_{step}.pkl'), 'wb') as f:
             pickle.dump(extra_data, f)
@@ -324,6 +329,8 @@ class DQNAgent:
                 self.memory = checkpoint_data['memory']
             if 'policy_state' in checkpoint_data and hasattr(self.policy, 'set_config'):
                 self.policy.set_config(checkpoint_data['policy_state'])
+            if 'losses' in checkpoint_data:
+                self.losses = checkpoint_data['losses']
         
             loaded_step = checkpoint_data.get('step', 0)
             self.logger.info(f"Checkpoint loaded from {checkpoint_path}")
@@ -350,6 +357,8 @@ class DQNAgent:
                         self.memory = extra_data['memory']
                     if 'policy_state' in extra_data and hasattr(self.policy, 'set_config'):
                         self.policy.set_config(extra_data['policy_state'])
+                    if 'losses' in extra_data:
+                        self.losses = extra_data['losses']
             else:
                 print(f"Warning: No checkpoint found at {checkpoint_path}")
                 loaded_step = step if step is not None else 0

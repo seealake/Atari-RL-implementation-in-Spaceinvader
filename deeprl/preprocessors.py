@@ -30,9 +30,11 @@ class HistoryPreprocessor(Preprocessor):
     def process_state_for_network(self, state):
         """Returns a stack of the last `history_length` frames."""
         if len(self.history) == 0:
-            self.history = [np.zeros_like(state)] * self.history_length
+            # Initialize history with zeros of the same shape as the input state
+            self.history = [np.zeros_like(state) for _ in range(self.history_length)]
         self.history.pop(0)
-        self.history.append(state)
+        # Make a copy of state to avoid reference issues
+        self.history.append(state.copy() if hasattr(state, 'copy') else state)
         return np.stack(self.history, axis=-1)
 
     def process_state_for_memory(self, state):

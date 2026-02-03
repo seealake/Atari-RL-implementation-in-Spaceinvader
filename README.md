@@ -143,7 +143,7 @@ The convolutional neural network architecture follows the original DQN paper:
 | Parameter | Default Value | Description |
 |-----------|---------------|-------------|
 | Discount Factor (γ) | 0.99 | Future reward discount |
-| Learning Rate | 0.00025 (RMSprop) | Optimizer learning rate |
+| Learning Rate | 3e-4 (Adam) | Optimizer learning rate used in DQNAgent |
 | Replay Buffer Size | 500,000 | Maximum experiences stored |
 | Batch Size | 64 (in main script) | Training batch size |
 | Target Update Frequency | 5,000 steps | Steps between target network updates |
@@ -154,7 +154,7 @@ The convolutional neural network architecture follows the original DQN paper:
 | Final ε | 0.05 | Minimum exploration rate |
 | ε Decay Rate | 1e-5 | Exponential decay rate for ε |
 
-> **Note**: The `DQNAgent` class has a default `batch_size=32`, but `dqn_atari.py` overrides this to `batch_size=64`.
+> **Note**: The `DQNAgent` class has a default `batch_size=32`, but `dqn_atari.py` overrides this to `batch_size=64`. Additionally, while model creation functions use RMSprop optimizer, the `DQNAgent` class reinitializes training with Adam optimizer (learning_rate=3e-4) and Huber loss.
 
 ## 📝 License
 

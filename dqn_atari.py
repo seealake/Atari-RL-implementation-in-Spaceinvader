@@ -198,7 +198,7 @@ def main():
             )
 
             if args.checkpoint_file:
-                checkpoint_path = os.path.join(args.checkpoint_dir, args.checkpoint_file)
+                checkpoint_path = os.path.join(checkpoint_dir, args.checkpoint_file)
                 if os.path.exists(checkpoint_path):
                     step = agent.load_checkpoint(checkpoint_path)
                     args.start_step = step
@@ -207,7 +207,7 @@ def main():
                     print(f"Specified checkpoint not found: {checkpoint_path}")
                     args.start_step = 0
             elif args.start_step > 0:
-                latest_tf_checkpoint = tf.train.latest_checkpoint(args.checkpoint_dir)
+                latest_tf_checkpoint = tf.train.latest_checkpoint(checkpoint_dir)
                 if latest_tf_checkpoint:
                     # Handle checkpoint filename format like 'checkpoint_100000-1'
                     try:
@@ -215,7 +215,7 @@ def main():
                     except (ValueError, IndexError):
                         print(f"Warning: Could not parse step from checkpoint: {latest_tf_checkpoint}")
                         step = args.start_step
-                    agent.load_checkpoint(args.checkpoint_dir, step)
+                    agent.load_checkpoint(checkpoint_dir, step)
                     args.start_step = step
                     print(f"Resumed training from step {args.start_step}")
                 else:

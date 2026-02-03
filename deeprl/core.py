@@ -85,12 +85,22 @@ class ReplayMemory:
             idx = np.random.randint(self.history_length, max_index)
             attempts += 1
             
-            # Skip if any frame in the state history crosses an episode boundary
-            # For the state (ending at idx-1), we need to check if any of the frames
-            # from (idx - history_length) to (idx - 2) are terminal states
-            # (because if frame at idx-2 is terminal, then frame at idx-1 starts a new episode)
+            # Skip if state history crosses an episode boundary OR if the previous 
+            # transition ended the episode (making current transition invalid)
+            #
+            # state = frames[idx-history_length, ..., idx-2, idx-1]
+            # We check that:
+            # 1. dones[idx-history_length] to dones[idx-2] are all False 
+            #    (so state stack doesn't cross episode boundaries)
+            # 2. dones[idx-1] is False 
+            #    (because if dones[idx-1]=True, frames[idx] is from a NEW episode,
+            #     and actions[idx] was chosen from the new episode's first state,
+            #     NOT from _get_state(idx-1) which is from the old episode)
+            #
+            # We check dones at indices: idx-history_length, ..., idx-2, idx-1
+            # which corresponds to i in range(1, history_length+1) for check_idx = idx - i
             valid = True
-            for i in range(2, self.history_length + 1):
+            for i in range(1, self.history_length + 1):
                 check_idx = (idx - i) % self.max_size
                 if self.dones[check_idx]:
                     valid = False
@@ -113,30 +123,27 @@ class ReplayMemory:
         indices = np.array(valid_indices)
         
         # Memory layout: at index i, we store:
-        # - frames[i]: the frame observed after taking action
+        # - frames[i]: the frame observed AFTER taking actions[i]
         # - actions[i]: the action taken that led to frames[i]
-        # - rewards[i]: the reward received for taking that action
-        # - dones[i]: whether frames[i] is a terminal state
+        # - rewards[i]: the reward received for taking actions[i]
+        # - dones[i]: whether the episode ended after taking actions[i]
         #
         # For a transition (s, a, r, s'):
-        # Memory layout at index i stores the frame AFTER taking action[i] and receiving reward[i]
-        # So for a valid transition at index i:
-        # - state s = stack of frames ending at index (i-1), i.e., frames before action was taken
-        # - action a = actions[i-1], the action taken from state s
-        # - reward r = rewards[i-1], the reward received for taking that action
-        # - next_state s' = stack of frames ending at index i, i.e., the resulting state
-        # - done = dones[i-1], whether the episode ended after taking the action
+        # - state s = stack of frames ending at index (i-1)
+        # - action a = actions[i] (the action taken FROM state s that LED TO frames[i])
+        # - reward r = rewards[i] (the reward received for taking that action)
+        # - next_state s' = stack of frames ending at index i
+        # - done = dones[i] (whether the episode ended after taking the action)
         #
-        # Note: We sample 'index' which represents the next_state frame index
+        # Note: We sample 'idx' which represents the next_state's last frame index
         
         states = np.array([self._get_state(index - 1) for index in indices], dtype=np.float32) / 255.0
         next_states = np.array([self._get_state(index) for index in indices], dtype=np.float32) / 255.0
         
-        # Use (index - 1) to get the action, reward, and done corresponding to the transition
-        prev_indices = (indices - 1) % self.max_size
-        actions = self.actions[prev_indices]
-        rewards = self.rewards[prev_indices]
-        dones = self.dones[prev_indices].astype(np.float32)
+        # Use index (not index-1) to get the action, reward, and done for the transition
+        actions = self.actions[indices]
+        rewards = self.rewards[indices]
+        dones = self.dones[indices].astype(np.float32)
         
         return states, actions, rewards, next_states, dones
 

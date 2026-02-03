@@ -100,17 +100,20 @@ class GreedyEpsilonPolicy(Policy):
         ----------
         q_values: np.array
           Array-like structure of floats representing the Q-values for
-          each action.
+          each action. Can be 1D (num_actions,) or 2D (batch_size, num_actions).
 
         Returns
         -------
         int:
           The action index chosen.
         """
+        q_values = np.atleast_2d(q_values)
+        num_actions = q_values.shape[-1]
         if np.random.rand() < self.epsilon:
-            return np.random.randint(0, len(q_values))
+            return int(np.random.randint(0, num_actions))
         else:
-            return np.argmax(q_values)
+            # Flatten to 1D if needed before argmax to get correct action index
+            return int(np.argmax(q_values.flatten()[:num_actions]))
 
     def get_config(self):
         return {'epsilon': self.epsilon}
@@ -129,7 +132,11 @@ class LinearDecayGreedyEpsilonPolicy(Policy):
 
     def select_action(self, q_values, is_training=True):
         if is_training:
-            epsilon = self.start_value - (self.start_value - self.end_value) * (self.current_step / self.num_steps)
+            # Avoid division by zero
+            if self.num_steps > 0:
+                epsilon = self.start_value - (self.start_value - self.end_value) * (self.current_step / self.num_steps)
+            else:
+                epsilon = self.end_value
             epsilon = max(epsilon, self.end_value)
             self.epsilon_policy.epsilon = epsilon
             self.current_step += 1
@@ -137,6 +144,25 @@ class LinearDecayGreedyEpsilonPolicy(Policy):
 
     def reset(self):
         self.current_step = 0
+
+    def get_config(self):
+        return {
+            'epsilon_policy': self.epsilon_policy.get_config(),
+            'start_value': self.start_value,
+            'end_value': self.end_value,
+            'num_steps': self.num_steps,
+            'current_step': self.current_step
+        }
+
+    def set_config(self, config):
+        self.start_value = config['start_value']
+        self.end_value = config['end_value']
+        self.num_steps = config['num_steps']
+        self.current_step = config['current_step']
+        if hasattr(self.epsilon_policy, 'set_config'):
+            self.epsilon_policy.set_config(config['epsilon_policy'])
+        else:
+            self.epsilon_policy.epsilon = config['epsilon_policy'].get('epsilon', self.end_value)
 
 
 class ExponentialDecayGreedyEpsilonPolicy(Policy):

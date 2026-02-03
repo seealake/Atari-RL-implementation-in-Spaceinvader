@@ -1,7 +1,5 @@
 """Core classes."""
 
-from collections import deque
-import random
 import numpy as np
 from PIL import Image
 
@@ -71,23 +69,85 @@ class ReplayMemory:
 
     def sample(self, batch_size):
         max_index = min(self.count, self.max_size)
-        indices = np.random.randint(self.history_length, max_index, size=batch_size)
+        
+        # Need at least history_length + 1 frames to sample (for state and next_state)
+        if max_index <= self.history_length:
+            raise ValueError(f"Not enough samples in memory. Have {max_index}, need at least {self.history_length + 1}")
+        
+        # Ensure we don't sample from indices that would wrap around incorrectly
+        # or sample terminal states as the "current" state
+        valid_indices = []
+        max_attempts = batch_size * 10  # Prevent infinite loop
+        attempts = 0
+        
+        while len(valid_indices) < batch_size and attempts < max_attempts:
+            # Sample index for the 'next_state' frame (the frame after taking action)
+            idx = np.random.randint(self.history_length, max_index)
+            attempts += 1
+            
+            # Skip if any frame in the state history crosses an episode boundary
+            # For the state (ending at idx-1), we need to check if any of the frames
+            # from (idx - history_length) to (idx - 2) are terminal states
+            # (because if frame at idx-2 is terminal, then frame at idx-1 starts a new episode)
+            valid = True
+            for i in range(2, self.history_length + 1):
+                check_idx = (idx - i) % self.max_size
+                if self.dones[check_idx]:
+                    valid = False
+                    break
+            
+            # Also avoid sampling the current write position if buffer is full
+            if self.count >= self.max_size:
+                if abs(idx - self.current) < self.history_length + 1:
+                    valid = False
+            
+            if valid:
+                valid_indices.append(idx)
+        
+        # If we couldn't find enough valid samples, fall back to random sampling
+        if len(valid_indices) < batch_size:
+            remaining = batch_size - len(valid_indices)
+            fallback_indices = np.random.randint(self.history_length, max_index, size=remaining)
+            valid_indices.extend(fallback_indices.tolist())
+        
+        indices = np.array(valid_indices)
+        
+        # Memory layout: at index i, we store:
+        # - frames[i]: the frame observed after taking action
+        # - actions[i]: the action taken that led to frames[i]
+        # - rewards[i]: the reward received for taking that action
+        # - dones[i]: whether frames[i] is a terminal state
+        #
+        # For a transition (s, a, r, s'):
+        # Memory layout at index i stores the frame AFTER taking action[i] and receiving reward[i]
+        # So for a valid transition at index i:
+        # - state s = stack of frames ending at index (i-1), i.e., frames before action was taken
+        # - action a = actions[i-1], the action taken from state s
+        # - reward r = rewards[i-1], the reward received for taking that action
+        # - next_state s' = stack of frames ending at index i, i.e., the resulting state
+        # - done = dones[i-1], whether the episode ended after taking the action
+        #
+        # Note: We sample 'index' which represents the next_state frame index
         
         states = np.array([self._get_state(index - 1) for index in indices], dtype=np.float32) / 255.0
         next_states = np.array([self._get_state(index) for index in indices], dtype=np.float32) / 255.0
         
-        actions = self.actions[indices]
-        rewards = self.rewards[indices]
-        dones = self.dones[indices]
+        # Use (index - 1) to get the action, reward, and done corresponding to the transition
+        prev_indices = (indices - 1) % self.max_size
+        actions = self.actions[prev_indices]
+        rewards = self.rewards[prev_indices]
+        dones = self.dones[prev_indices].astype(np.float32)
         
         return states, actions, rewards, next_states, dones
 
     def _get_state(self, index):
+        """Get a state consisting of history_length consecutive frames ending at index."""
         if index < self.history_length - 1:
+            # Not enough frames, pad with zeros or first frame
             frames = [self.frames[0]] * (self.history_length - 1 - index)
-            frames.extend([self.frames[i % self.count] for i in range(index + 1)])
+            frames.extend([self.frames[i % self.max_size] for i in range(index + 1)])
         else:
-            frames = [self.frames[i % self.count] for i in range(index - self.history_length + 1, index + 1)]
+            frames = [self.frames[(index - self.history_length + 1 + i) % self.max_size] for i in range(self.history_length)]
         return np.stack(frames, axis=-1)
 
     def __len__(self):

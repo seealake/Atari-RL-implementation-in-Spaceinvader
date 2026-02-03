@@ -1,6 +1,6 @@
 #!/usr/bin/env python
-"""Yes. Run Atari Environment with DQN."""
-"""LINEAR, DQN, DOUBLE DQN, DUELING DQN"""
+"""Run Atari Environment with DQN."""
+"""Supports: LINEAR, DQN, DOUBLE DQN, DUELING DQN"""
 import argparse
 import os
 import random
@@ -10,8 +10,7 @@ import gym
 from gym.wrappers import RecordVideo
 import deeprl as tfrl
 from deeprl.dqn import DQNAgent
-from deeprl.objectives import mean_huber_loss
-from deeprl.policy import LinearDecayGreedyEpsilonPolicy, GreedyEpsilonPolicy, ExponentialDecayGreedyEpsilonPolicy
+from deeprl.policy import GreedyEpsilonPolicy, ExponentialDecayGreedyEpsilonPolicy
 from deeprl.preprocessors import AtariPreprocessor, HistoryPreprocessor, PreprocessorSequence
 import matplotlib.pyplot as plt
 import gc
@@ -79,12 +78,16 @@ def create_dueling_q_network(input_shape, num_actions, model_name='dueling_q_net
     return model
 
 def make_env(env_name, output_directory):
+    os.makedirs(output_directory, exist_ok=True)
     env = gym.make(env_name)
     env = RecordVideo(env, video_folder=output_directory, episode_trigger=lambda x: True)
     return env
 
 def get_output_folder(parent_dir, env_name):
     """Return save folder."""
+    # Sanitize env_name to be a valid folder name (replace slashes with underscores)
+    safe_env_name = env_name.replace('/', '_').replace('\\', '_')
+    
     os.makedirs(parent_dir, exist_ok=True)
     experiment_id = 0
     for folder_name in os.listdir(parent_dir):
@@ -98,11 +101,15 @@ def get_output_folder(parent_dir, env_name):
             pass
     experiment_id += 1
 
-    parent_dir = os.path.join(parent_dir, env_name)
+    parent_dir = os.path.join(parent_dir, safe_env_name)
     parent_dir = parent_dir + '-run{}'.format(experiment_id)
     return parent_dir
 
 def plot_learning_curve(evaluation_results, output_dir, mode):
+    if not evaluation_results:
+        print("No evaluation results to plot")
+        return
+    
     steps, means, stds = zip(*evaluation_results)
     plt.figure(figsize=(10, 6))
     plt.plot(steps, means)
@@ -110,6 +117,7 @@ def plot_learning_curve(evaluation_results, output_dir, mode):
     plt.title(f'Learning Curve for {mode.capitalize()} Q-Network')
     plt.xlabel('Steps')
     plt.ylabel('Mean Reward')
+    os.makedirs(output_dir, exist_ok=True)
     plt.savefig(os.path.join(output_dir, f'{mode}_learning_curve.png'))
     plt.close()
 
@@ -124,7 +132,7 @@ def create_final_evaluation_table(results):
 def main():
     try:
         parser = argparse.ArgumentParser(description='Run DQN on Atari Space Invaders')
-        parser.add_argument('--env', default='SpaceInvaders-v0', help='Atari env name')
+        parser.add_argument('--env', default='ALE/SpaceInvaders-v5', help='Atari env name')
         parser.add_argument('-o', '--output', default='atari-v0', help='Directory to save data to')
         parser.add_argument('--seed', default=0, type=int, help='Random seed')
         parser.add_argument('--mode', required=True, choices=['linear', 'linear_double', 'deep', 'double', 'dueling'],
@@ -201,7 +209,12 @@ def main():
             elif args.start_step > 0:
                 latest_tf_checkpoint = tf.train.latest_checkpoint(args.checkpoint_dir)
                 if latest_tf_checkpoint:
-                    step = int(latest_tf_checkpoint.split('_')[-1])
+                    # Handle checkpoint filename format like 'checkpoint_100000-1'
+                    try:
+                        step = int(latest_tf_checkpoint.split('_')[-1].split('-')[0])
+                    except (ValueError, IndexError):
+                        print(f"Warning: Could not parse step from checkpoint: {latest_tf_checkpoint}")
+                        step = args.start_step
                     agent.load_checkpoint(args.checkpoint_dir, step)
                     args.start_step = step
                     print(f"Resumed training from step {args.start_step}")
@@ -209,9 +222,15 @@ def main():
                     print(f"No checkpoint found, starting from beginning")
                     args.start_step = 0
 
+            # Calculate the actual end step for this training session
+            # fit() iterates from start_step to num_iterations, so we need:
+            # end_step = start_step + remaining_iterations
+            remaining_iterations = total_iterations - iterations_done
+            end_step = args.start_step + remaining_iterations
+            
             evaluation_results, final_result = agent.fit(
                 env, 
-                num_iterations=total_iterations - iterations_done,
+                num_iterations=end_step,
                 start_step=args.start_step,
                 max_episode_length=None,
                 checkpoint_dir=checkpoint_dir,
@@ -222,9 +241,14 @@ def main():
             all_evaluation_results.extend(evaluation_results)
 
             if final_result is None:
-                iterations_done += evaluation_results[-1][0] - args.start_step
-                args.start_step = evaluation_results[-1][0]
-                print(f"Restarting training from step {args.start_step}")
+                # Check if evaluation_results is not empty before accessing
+                if evaluation_results:
+                    iterations_done += evaluation_results[-1][0] - args.start_step
+                    args.start_step = evaluation_results[-1][0]
+                    print(f"Restarting training from step {args.start_step}")
+                else:
+                    print("Warning: No evaluation results available for restart calculation")
+                    break
             else:
                 break
 
@@ -239,10 +263,8 @@ def main():
             print(f"Final Result for {args.mode} Q-network:")
             print(f"Mean Reward: {final_mean_reward:.2f} +/- {final_std_reward:.2f}")
             
-            model_save_path = os.path.join(output_dir, 'final_saved_model')
-            tf.keras.models.save_model(agent.q_network, model_save_path)
-            print(f"Final model saved to {model_save_path}")
-            
+            # Note: 'agent' might have been deleted in the loop, so we need to check
+            # The final model should be saved inside the fit() method
             with open(os.path.join(output_dir, 'final_results.txt'), 'w') as f:
                 f.write(f"Mode: {args.mode}\n")
                 f.write(f"Final Mean Reward: {final_mean_reward:.2f}\n")

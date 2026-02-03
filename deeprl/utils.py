@@ -38,7 +38,7 @@ def get_uninitialized_variables(variables=None):
 
 
 def get_soft_target_model_updates(target, source, tau):
-    r"""Return list of target model update ops using soft update.
+    r"""Perform soft update of target network weights.
 
     The update is of the form:
 
@@ -54,18 +54,13 @@ def get_soft_target_model_updates(target, source, tau):
     tau: float
       The weight of the source weights to the target weights used
       during update.
-
-    Returns
-    -------
-    list(tf.Tensor)
-      List of TensorFlow update operations.
     """
     for target_var, source_var in zip(target.trainable_variables, source.trainable_variables):
         target_var.assign((1. - tau) * target_var + tau * source_var)
 
 
 def get_hard_target_model_updates(target, source):
-    """Return list of target model update ops using hard update.
+    """Perform hard update of target network weights.
 
     The source weights are copied directly to the target network.
 
@@ -75,11 +70,6 @@ def get_hard_target_model_updates(target, source):
       The target model. Should have the same architecture as source model.
     source: keras.models.Model
       The source model. Should have the same architecture as target model.
-
-    Returns
-    -------
-    list(tf.Tensor)
-      List of TensorFlow update operations.
     """
     for target_var, source_var in zip(target.trainable_variables, source.trainable_variables):
         target_var.assign(source_var)

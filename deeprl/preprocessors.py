@@ -3,7 +3,6 @@
 import numpy as np
 from PIL import Image
 
-from deeprl import utils
 from deeprl.core import Preprocessor
 
 
@@ -27,6 +26,7 @@ class HistoryPreprocessor(Preprocessor):
         """Initialize the HistoryPreprocessor with the desired history length."""
         self.history_length = history_length
         self.history = []
+        self.history_memory = []  # Separate history for memory (uint8)
 
     def process_state_for_network(self, state):
         """Returns a stack of the last `history_length` frames."""
@@ -36,9 +36,18 @@ class HistoryPreprocessor(Preprocessor):
         self.history.append(state)
         return np.stack(self.history, axis=-1)
 
+    def process_state_for_memory(self, state):
+        """Returns a stack of the last `history_length` frames for memory storage."""
+        if len(self.history_memory) == 0:
+            self.history_memory = [np.zeros_like(state)] * self.history_length
+        self.history_memory.pop(0)
+        self.history_memory.append(state)
+        return np.stack(self.history_memory, axis=-1)
+
     def reset(self):
         """Reset the history. Useful when starting a new episode."""
         self.history = []
+        self.history_memory = []
 
     def get_config(self):
         return {'history_length': self.history_length}
@@ -93,7 +102,7 @@ class AtariPreprocessor(Preprocessor):
 
     def _preprocess_frame(self, frame):
         """Convert the frame to greyscale and resize it."""
-        frame = np.mean(frame, axis=2)  # Convert to greyscale
+        frame = np.mean(frame, axis=2).astype(np.uint8)  # Convert to greyscale, must be uint8 for PIL
         frame = Image.fromarray(frame)
         frame = frame.resize(self.new_size)
         return np.array(frame)
@@ -105,6 +114,14 @@ class AtariPreprocessor(Preprocessor):
     def process_reward(self, reward):
         """Clip the reward between -1 and 1."""
         return np.clip(reward, -1, 1)
+
+    def reset(self):
+        """Reset internal state. AtariPreprocessor is stateless, so this is a no-op."""
+        pass
+
+    def get_config(self):
+        """Return configuration of the preprocessor."""
+        return {'new_size': self.new_size}
 
 
 class PreprocessorSequence(Preprocessor):

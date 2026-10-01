@@ -162,7 +162,7 @@ def make_env(env_name, output_directory=None, record_video=True, *, video_freq=T
         raise
 
 def get_output_folder(parent_dir, env_name):
-    """Return save folder."""
+    """Reserve and return a unique run folder."""
     # Sanitize env_name to be a valid folder name (replace slashes with underscores)
     safe_env_name = env_name.replace('/', '_').replace('\\', '_')
     
@@ -175,13 +175,18 @@ def get_output_folder(parent_dir, env_name):
             folder_name = int(folder_name.split('-run')[-1])
             if folder_name > experiment_id:
                 experiment_id = folder_name
-        except:
+        except ValueError:
             pass
     experiment_id += 1
 
     parent_dir = os.path.join(parent_dir, safe_env_name)
-    parent_dir = parent_dir + '-run{}'.format(experiment_id)
-    return parent_dir
+    while True:
+        output_dir = parent_dir + '-run{}'.format(experiment_id)
+        try:
+            os.makedirs(output_dir)
+            return output_dir
+        except FileExistsError:
+            experiment_id += 1
 
 def plot_learning_curve(evaluation_results, output_dir, mode):
     if not evaluation_results:
@@ -233,8 +238,9 @@ def build_parser():
         parser.add_argument(*options, **kwargs)
     parser.add_argument('--smoke-test', '--smoke_test', action='store_true',
                         help='Cap training at 128 steps, use small replay and at most 2 CPU threads')
-    parser.add_argument('--resume', type=Path, help='Existing run directory to resume')
-    parser.add_argument('--checkpoint-file', '--checkpoint_file', type=Path,
+    resume = parser.add_mutually_exclusive_group()
+    resume.add_argument('--resume', type=Path, help='Existing run directory to resume')
+    resume.add_argument('--checkpoint-file', '--checkpoint_file', type=Path,
                         help='Specific trusted TensorFlow checkpoint prefix, directory or sidecar')
     parser.add_argument('--start-step', '--start_step', type=int, default=0,
                         help='Optional expected resume step; requires a checkpoint')
@@ -251,13 +257,25 @@ def main(argv=None):
             source = source.expanduser().resolve()
             if args.resume and not (source / 'config.json').is_file():
                 raise ValueError('--resume expects a run directory; use --checkpoint-file for a specific checkpoint')
-            run_dir = next((path for path in (source, source.parent, source.parent.parent)
-                            if (path / 'config.json').is_file()), None)
+            candidates = (source,) if args.resume else (source, *source.parents)
+            for path in candidates:
+                config_file = path / 'config.json'
+                if not config_file.is_file():
+                    continue
+                with config_file.open(encoding='utf-8') as handle:
+                    candidate = json.load(handle)
+                required = {'env', 'mode', 'checkpoint_dir', 'frame_size', 'history_length', 'memory_size'}
+                if not isinstance(candidate, dict) or not required.issubset(candidate):
+                    continue
+                if not isinstance(candidate['checkpoint_dir'], str):
+                    continue
+                if args.checkpoint_file and not source.is_relative_to((path / candidate['checkpoint_dir']).resolve()):
+                    continue
+                run_dir, saved_config = path, candidate
+                break
             if args.resume and run_dir is None:
-                raise ValueError('--resume must point to an existing run containing config.json')
+                raise ValueError('--resume must point to a run containing a valid training config.json')
             if run_dir is not None:
-                with (run_dir / 'config.json').open(encoding='utf-8') as handle:
-                    saved_config = json.load(handle)
                 parser.set_defaults(**{field.name: saved_config[field.name] for field in fields(TrainingConfig)
                                        if field.name in saved_config})
                 args = parser.parse_args(argv)

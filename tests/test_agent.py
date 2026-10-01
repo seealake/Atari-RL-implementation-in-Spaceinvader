@@ -1,12 +1,16 @@
 import random
 import pickle
+import json
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
+from pathlib import Path
 
 import gymnasium as gym
 import numpy as np
 import pytest
 import tensorflow as tf
 
-from dqn_atari import TrainingConfig, build_parser, main
+from dqn_atari import TrainingConfig, build_parser, get_output_folder, main
 
 
 class CountingEnv(gym.Env):
@@ -142,3 +146,31 @@ def test_missing_cli_checkpoint_fails_before_allocating_replay(tmp_path):
         main(['--checkpoint-file', str(tmp_path / 'missing')])
     assert error.value.code != 0
     assert not list(tmp_path.iterdir())
+
+
+def test_resume_sources_are_mutually_exclusive():
+    with pytest.raises(SystemExit) as error:
+        build_parser().parse_args(['--resume', 'run-a', '--checkpoint-file', 'run-b/ckpt-10'])
+    assert error.value.code != 0
+
+
+def test_concurrent_runs_reserve_distinct_directories(tmp_path):
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        folders = list(pool.map(lambda _: get_output_folder(tmp_path, 'ALE/SpaceInvaders-v5'), range(4)))
+    assert len(set(folders)) == 4
+    assert all(Path(folder).is_dir() for folder in folders)
+
+
+@pytest.mark.parametrize('parent_config', [{'iterations': 17}, asdict(TrainingConfig(iterations=17))])
+def test_checkpoint_ignores_unrelated_parent_config(tmp_path, monkeypatch, parent_config):
+    (tmp_path / 'config.json').write_text(json.dumps(parent_config), encoding='utf-8')
+    seen_iterations = []
+
+    def stop_before_training(config):
+        seen_iterations.append(config.iterations)
+        raise ValueError('Stop before allocating training resources')
+
+    monkeypatch.setattr(TrainingConfig, 'validate', stop_before_training)
+    with pytest.raises(SystemExit):
+        main(['--checkpoint-file', str(tmp_path / 'other_exports' / 'ckpt-1')])
+    assert seen_iterations == [TrainingConfig.iterations]

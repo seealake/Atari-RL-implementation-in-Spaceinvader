@@ -50,15 +50,17 @@ def test_all_modes_train_on_real_atari_and_reload(agent_factory, mode):
 @pytest.mark.integration
 def test_cli_video_and_resume(tmp_path):
     script = Path(__file__).resolve().parents[1] / 'dqn_atari.py'
+    checkpoint_subdir = 'artifacts/weights/checkpoints'
 
     def run(*arguments):
         result = subprocess.run([sys.executable, str(script), *arguments], text=True,
-                                capture_output=True, timeout=120)
+                                capture_output=True, timeout=120, cwd=tmp_path)
         assert result.returncode == 0, result.stdout + result.stderr
 
     run('--smoke-test', '--iterations', '32', '--frame-size', '40', '--hidden-units', '16',
         '--batch-size', '2', '--burn-in', '4', '--max-episode-length', '8',
         '--eval-freq', '16', '--checkpoint-freq', '16', '--restart-freq', '8',
+        '--checkpoint-dir', checkpoint_subdir,
         '--output', str(tmp_path))
     directory = next((tmp_path / 'deep').glob('*-run*'))
     report = (directory / 'final_results.txt').read_text()
@@ -78,4 +80,11 @@ def test_cli_video_and_resume(tmp_path):
     for video, checksum in checksums.items():
         assert hashlib.sha256(video.read_bytes()).hexdigest() == checksum
     assert len(list((directory / 'videos').rglob('*.mp4'))) > len(videos)
-    assert len(list((directory / 'checkpoints').glob('*.index'))) == 2
+    checkpoints = directory / checkpoint_subdir
+    assert len(list(checkpoints.glob('*.index'))) == 2
+    run('--checkpoint-file', str(checkpoints / 'ckpt-48'), '--iterations', '4',
+        '--threads', '2', '--no-record-video')
+    report = (directory / 'final_results.txt').read_text()
+    assert 'Completed steps: 52\n' in report and 'Gradient updates: 13\n' in report
+    assert len(list((tmp_path / 'deep').glob('*-run*'))) == 1
+    assert len(list((directory / 'videos').rglob('*.mp4'))) == len(videos) + 1

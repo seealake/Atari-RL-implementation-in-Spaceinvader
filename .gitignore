@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv*/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.DS_Store
+.vs/
+atari-v0/
+checkpoints/
+checkpoint_model_*/
+final_model_*/
+*.log
+Training_loss.png
+.test-runs/

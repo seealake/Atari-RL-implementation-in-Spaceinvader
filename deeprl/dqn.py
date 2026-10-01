@@ -1,34 +1,44 @@
 import numpy as np
-import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
 from tensorflow.keras.optimizers import Adam
 import tensorflow as tf
 import gc
 import os
 import logging
 import pickle
+import copy
+import gzip
+from pathlib import Path
+import random
+import re
+
 class DQNAgent:
     def __init__(self, model, input_shape, num_actions, preprocessor, memory, policy,
                  gamma=0.99, target_update_freq=1000, num_burn_in=50000, 
-                 train_freq=4, batch_size=32, double_q=False, dueling=False, tau=0.001, 
-                 checkpoint_dir='checkpoints'):
+                 train_freq=4, batch_size=32, double_q=False, dueling=False, tau=0.001,
+                 checkpoint_dir='checkpoints', output_dir='.', learning_rate=3e-4,
+                 keep_checkpoints=2, reward_clip=1.0, gradient_clip=5.0):
         # Configure logging - only set basicConfig once
         if not logging.getLogger().handlers:
             logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
         
-        self.logger = logging.getLogger(__name__)
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.logger = logging.getLogger(f'{__name__}.{id(self)}')
         self.logger.setLevel(logging.INFO)
         
         # Avoid adding duplicate file handlers by checking existing handlers
         has_file_handler = any(isinstance(h, logging.FileHandler) for h in self.logger.handlers)
         if not has_file_handler:
-            file_handler = logging.FileHandler('dqn_training.log')
+            file_handler = logging.FileHandler(self.output_dir / 'dqn_training.log', encoding='utf-8')
             file_handler.setLevel(logging.INFO)
             file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
             self.logger.addHandler(file_handler)
         
         self.losses = []
+        self.evaluation_results = []
         self.input_shape = input_shape
-        self.num_actions = num_actions
+        self.num_actions = int(num_actions)
         self.memory = memory
         self.policy = policy
         self.preprocessor = preprocessor
@@ -41,31 +51,36 @@ class DQNAgent:
         self.dueling = dueling
         self.tau = tau
         self.steps = 0
-        self.optimizer = Adam(learning_rate=3e-4)
+        self.reward_clip, self.gradient_clip = reward_clip, gradient_clip
+        self.optimizer = Adam(learning_rate=learning_rate)
         self.loss_func = tf.keras.losses.Huber()
         self.q_network = model
         self.target_network = tf.keras.models.clone_model(model)
         self.target_network.set_weights(self.q_network.get_weights())
         self.q_network.compile(optimizer=self.optimizer, loss=self.loss_func)
+        self.optimizer.build(self.q_network.trainable_variables)
         
         self.checkpoint_dir = checkpoint_dir
         if not os.path.exists(self.checkpoint_dir):
             os.makedirs(self.checkpoint_dir)
+        self.checkpoint = tf.train.Checkpoint(
+            model=self.q_network, target_network=self.target_network, optimizer=self.optimizer
+        )
+        self.checkpoint_manager = tf.train.CheckpointManager(
+            self.checkpoint, self.checkpoint_dir, max_to_keep=keep_checkpoints
+        )
         
         self.logger.info("DQNAgent initialized")
 
     def update_policy(self):
-        # Need enough samples for both batch_size and memory sampling requirements
-        # Memory.sample requires at least history_length + 2 samples
-        min_samples_needed = max(self.batch_size, self.memory.history_length + 2)
-        if len(self.memory) < min_samples_needed:
+        if len(self.memory) < self.batch_size:
             return None
 
         states, actions, rewards, next_states, dones = self.memory.sample(self.batch_size)
         states = tf.convert_to_tensor(states, dtype=tf.float32)
         next_states = tf.convert_to_tensor(next_states, dtype=tf.float32)
         actions = tf.convert_to_tensor(actions, dtype=tf.int32)  # Convert to int32 for one_hot
-        rewards = tf.convert_to_tensor(np.clip(rewards, -1, 1), dtype=tf.float32)
+        rewards = tf.convert_to_tensor(np.clip(rewards, -self.reward_clip, self.reward_clip), dtype=tf.float32)
         dones = tf.convert_to_tensor(dones, dtype=tf.float32)
 
         target_q_values_next = self.target_network(next_states)
@@ -93,7 +108,8 @@ class DQNAgent:
             loss = self.loss_func(target_values, q_values_for_actions)
 
         gradients = tape.gradient(loss, self.q_network.trainable_variables)
-        gradients, _ = tf.clip_by_global_norm(gradients, 5.0)  
+        tf.debugging.assert_all_finite(loss, 'Non-finite DQN loss')
+        gradients, _ = tf.clip_by_global_norm(gradients, self.gradient_clip)
         self.optimizer.apply_gradients(zip(gradients, self.q_network.trainable_variables))
         assert states.shape[0] == self.batch_size
         assert actions.shape[0] == self.batch_size
@@ -107,126 +123,96 @@ class DQNAgent:
         for target_param, local_param in zip(self.target_network.trainable_variables, self.q_network.trainable_variables):
             target_param.assign(self.tau * local_param + (1.0 - self.tau) * target_param)
 
-    def fit(self, env, num_iterations, start_step=0, max_episode_length=None, checkpoint_dir='checkpoints', checkpoint_freq=50000, restart_freq=500000):
-        # Handle both old and new Gym API
-        reset_result = env.reset()
-        if isinstance(reset_result, tuple):
-            state, _ = reset_result  # New Gym API (v0.26+)
-        else:
-            state = reset_result  # Old Gym API
-        self.preprocessor.reset()
-        state = self.preprocessor.process_state_for_network(state)
-
-        evaluation_results = []
-        
-        # Synchronize policy step counter with training start_step
-        # This ensures epsilon decay is consistent when resuming training
+    def fit(self, env, num_iterations, start_step=None, max_episode_length=None,
+            checkpoint_dir=None, checkpoint_freq=50000, restart_freq=500000,
+            eval_env=None, eval_freq=10000, eval_episodes=10, final_eval_episodes=100,
+            seed=0, log_freq=1000):
+        if start_step is not None and start_step != self.steps:
+            raise ValueError("start_step must match the loaded checkpoint")
+        if num_iterations <= self.steps:
+            raise ValueError("The end step must exceed the completed step count")
+        if ((eval_freq and eval_episodes) or final_eval_episodes) and (
+                eval_env is None or eval_env is env):
+            raise ValueError("Pass a separate environment for evaluation")
+        if checkpoint_dir is not None and Path(checkpoint_dir) != Path(self.checkpoint_dir):
+            raise ValueError("Set checkpoint_dir when constructing DQNAgent")
         if hasattr(self.policy, 'step'):
-            self.policy.step = start_step
+            self.policy.step = self.steps
         elif hasattr(self.policy, 'current_step'):
-            self.policy.current_step = start_step
+            self.policy.current_step = self.steps
 
-        for t in range(start_step, num_iterations):
-            if t % 100 == 0: 
-                self.logger.info(f"Step {t}: Training in progress")
-        
-            if t % 1000 == 0:
-                current_epsilon = self.policy.epsilon_policy.epsilon
-                self.logger.info(f"Step {t}: Current epsilon: {current_epsilon:.4f}")
-        
-            # Store the current state's last frame before taking action
-            frame_to_store = (state[:,:,-1] * 255).astype(np.uint8)
-            
-            action = self.select_action(np.expand_dims(state, axis=0), is_training=True)
-            # Handle both old and new Gym API for step()
-            step_result = env.step(action)
-            if len(step_result) == 5:
-                next_state, reward, terminated, truncated, _ = step_result  # New Gym API
-                done = terminated or truncated
-            else:
-                next_state, reward, done, _ = step_result  # Old Gym API
-            next_state = self.preprocessor.process_state_for_network(next_state)
-        
-            # Store transition: frame from current state, action taken, reward received, done flag
-            # The memory stores: frame[i] is the last frame of state from which action[i] was taken
-            # reward[i] and done[i] are the results of taking action[i]
-            self.memory.append(frame_to_store, action, reward, done)
-            if t >= self.num_burn_in and t % self.train_freq == 0:
+        def reset(seed=None):
+            observation, _ = env.reset(seed=seed)
+            self.preprocessor.reset()
+            self.memory.start_new_episode()
+            return self.preprocessor.process_state_for_network(observation)
+
+        state = reset(seed=seed + self.steps)
+        env.action_space.seed(seed + self.steps)
+        episode_steps, episode_reward = 0, 0.0
+        self.logger.info("Training from step %d to %d", self.steps, num_iterations)
+        for t in range(self.steps, num_iterations):
+            action = self.select_action(state[None, ...])
+            observation, reward, terminated, truncated, _ = env.step(action)
+            episode_steps += 1
+            episode_reward += float(reward)
+            truncated = truncated or (
+                max_episode_length is not None and episode_steps >= max_episode_length
+            )
+            done = bool(terminated or truncated)
+            next_state = self.preprocessor.process_state_for_network(observation)
+            self.memory.append(
+                np.rint(state[..., -1] * 255).astype(np.uint8), action, reward, done,
+                next_frame=np.rint(next_state[..., -1] * 255).astype(np.uint8),
+                terminal=terminated,
+            )
+            self.steps = t + 1
+            if self.steps >= self.num_burn_in and self.steps % self.train_freq == 0:
                 loss = self.update_policy()
                 if loss is not None:
-                    self.record_loss(float(loss.numpy()) if hasattr(loss, 'numpy') else float(loss))
-        
-            if t % checkpoint_freq == 0 and t > 0:
-                self.save_checkpoint(t, evaluation_results)
-        
+                    self.record_loss(float(loss.numpy()))
+            if self.steps >= self.num_burn_in and self.steps % self.target_update_freq == 0:
+                self.soft_update_target_network()
+
             state = next_state
             if done:
-                # Handle both old and new Gym API
-                reset_result = env.reset()
-                if isinstance(reset_result, tuple):
-                    state, _ = reset_result
-                else:
-                    state = reset_result
-                self.preprocessor.reset()
-                state = self.preprocessor.process_state_for_network(state)
-                self.logger.info(f"Episode ended at step {t}")
-        
-            if t >= self.num_burn_in and t % self.target_update_freq == 0:
-                self.soft_update_target_network()
-                self.logger.info(f"Target network updated at step {t}")
-        
-            if t % 10000 == 0 and t > 0:  
+                self.logger.info("Step %d: episode reward %.1f", self.steps, episode_reward)
+                state = reset()
+                episode_steps, episode_reward = 0, 0.0
+            if eval_freq and eval_episodes and self.steps % eval_freq == 0:
+                mean, std = self.evaluate(
+                    eval_env, eval_episodes, max_episode_length, seed=seed
+                )
+                self.evaluation_results.append((self.steps, mean, std))
+            restart = bool(restart_freq and self.steps % restart_freq == 0)
+            if restart and self.steps < num_iterations:
+                # Reset the environment only, never discard learned weights or Adam state.
+                state = reset()
+                episode_steps, episode_reward = 0, 0.0
                 gc.collect()
-                self.logger.info(f"Step {t}: Garbage collection performed")
-                self.save_model(f'checkpoint_model_{t}')
-                self.logger.info(f"Model checkpoint saved at step {t}")
-                
-                # Save preprocessor state before evaluation
-                saved_preprocessor_state = None
-                if hasattr(self.preprocessor, 'save_state'):
-                    saved_preprocessor_state = self.preprocessor.save_state()
-                
-                mean_reward, std_reward = self.evaluate(env, num_episodes=10)
-                
-                # Restore preprocessor state after evaluation
-                if saved_preprocessor_state is not None and hasattr(self.preprocessor, 'restore_state'):
-                    self.preprocessor.restore_state(saved_preprocessor_state)
-                
-                # After evaluation, the environment is in an unknown state.
-                # We need to reset and rebuild the state to continue training.
-                # Note: This means we lose the current episode progress, but ensures consistency.
-                reset_result = env.reset()
-                if isinstance(reset_result, tuple):
-                    state, _ = reset_result
-                else:
-                    state = reset_result
-                self.preprocessor.reset()
-                state = self.preprocessor.process_state_for_network(state)
-                
-                evaluation_results.append((t, mean_reward, std_reward))
-                self.logger.info(f"Step {t}: Mean reward: {mean_reward:.2f} +/- {std_reward:.2f}")
-                if len(self.losses) > 0:
-                    avg_loss = np.mean(self.losses[-10000:]) 
-                    self.logger.info(f"Step {t}: Average loss: {avg_loss:.4f}")
-                else:
-                    self.logger.info(f"Step {t}: No losses recorded yet")
-            self.logger.debug(f"Step {t}: Action {action}, Reward {reward}, Done {done}")
-        
-            if t > start_step and t % restart_freq == 0:
-                self.save_checkpoint(t, evaluation_results)
-                self.logger.info(f"Training paused at step {t} for potential restart")
-                return evaluation_results, None, t  
-        final_mean_reward, final_std_reward = self.evaluate(env, num_episodes=100)
+            periodic_save = bool(checkpoint_freq and self.steps % checkpoint_freq == 0)
+            if (periodic_save or restart) and self.steps < num_iterations:
+                self.save_checkpoint(self.steps, self.evaluation_results)
+            if self.steps % log_freq == 0 or self.steps == num_iterations:
+                epsilon = getattr(getattr(self.policy, 'epsilon_policy', self.policy), 'epsilon', 0)
+                self.logger.info(
+                    "Step %d/%d: epsilon %.4f, gradient updates %d",
+                    self.steps, num_iterations, epsilon, int(self.optimizer.iterations.numpy()),
+                )
+
+        final_result = None
+        if final_eval_episodes:
+            final_result = self.evaluate(
+                eval_env, final_eval_episodes, max_episode_length, seed=seed
+            )
+        self.save_checkpoint(self.steps, self.evaluation_results)
         self.plot_smoothed_losses()
-        self.logger.info(f"Final evaluation - Mean reward: {final_mean_reward:.2f} +/- {final_std_reward:.2f}")
-        self.save_model(f'final_model_{num_iterations}')
-        self.logger.info(f"Final model saved after {num_iterations} iterations")
-        # Always return 3 values for consistent interface: (evaluation_results, final_result, stop_step)
-        return evaluation_results, (final_mean_reward, final_std_reward), num_iterations
+        self.save_model(self.output_dir / 'final_model.keras')
+        return list(self.evaluation_results), final_result, self.steps
 
 
     def select_action(self, state, is_training=True):
-        q_values = self.q_network.predict(state, verbose=0)
+        q_values = self.q_network(tf.convert_to_tensor(state, dtype=tf.float32), training=False).numpy()
         if is_training:
             action = self.policy.select_action(q_values)
             # Ensure action is a Python int, not numpy int (for gym compatibility)
@@ -237,17 +223,18 @@ class DQNAgent:
                 q_values = q_values.flatten()
             return int(np.argmax(q_values))
 
-    def evaluate(self, env, num_episodes, max_episode_length=None):
+    def evaluate(self, env, num_episodes, max_episode_length=None, seed=0):
+        preprocessor = copy.deepcopy(self.preprocessor)
         episode_rewards = []
         for i in range(num_episodes):
             # Handle both old and new Gym API
-            reset_result = env.reset()
+            reset_result = env.reset(seed=seed + i)
             if isinstance(reset_result, tuple):
                 state, _ = reset_result  # New Gym API (v0.26+)
             else:
                 state = reset_result  # Old Gym API
-            self.preprocessor.reset()
-            state = self.preprocessor.process_state_for_network(state)
+            preprocessor.reset()
+            state = preprocessor.process_state_for_network(state)
             done = False
             step = 0
             episode_reward = 0
@@ -261,124 +248,162 @@ class DQNAgent:
                     done = terminated or truncated
                 else:
                     next_state, reward, done, _ = step_result  # Old Gym API
-                next_state = self.preprocessor.process_state_for_network(next_state)
+                next_state = preprocessor.process_state_for_network(next_state)
                 episode_reward += reward
                 state = next_state
                 step += 1
 
             episode_rewards.append(episode_reward)
-            print(f"Episode {i+1}/{num_episodes} - Reward: {episode_reward}")
+            self.logger.debug("Evaluation episode %d: reward %s", i + 1, episode_reward)
 
         mean_reward = np.mean(episode_rewards)
         std_reward = np.std(episode_rewards)
         print(f"Evaluation complete. Mean reward: {mean_reward:.2f} +/- {std_reward:.2f}")
-        return mean_reward, std_reward
+        return float(mean_reward), float(std_reward)
 
     def save_model(self, filepath):
-        tf.saved_model.save(self.q_network, filepath)
+        filepath = Path(filepath)
+        if filepath.suffix != '.keras':
+            filepath = Path(str(filepath) + '.keras')
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        self.q_network.save(filepath)
         print(f"Model saved to {filepath}")
+        return filepath
 
     def load_model(self, filepath):
-        self.q_network = tf.saved_model.load(filepath)
+        """Load network weights; use load_checkpoint to resume optimizer and replay."""
+        model = tf.keras.models.load_model(filepath, compile=False)
+        self.q_network.set_weights(model.get_weights())
+        self.target_network.set_weights(model.get_weights())
         print(f"Model loaded from {filepath}")
 
+    @staticmethod
+    def _checkpoint_step(path):
+        match = re.search(r"(?:ckpt-|checkpoint[-_])(\d+)", Path(path).name)
+        if not match:
+            raise ValueError(f"Unrecognized checkpoint name: {path}")
+        return int(match.group(1))
+
     def save_checkpoint(self, step, evaluation_results):
-        checkpoint = tf.train.Checkpoint(model=self.q_network, optimizer=self.optimizer)
-        checkpoint.save(file_prefix=os.path.join(self.checkpoint_dir, f"checkpoint_{step}"))
+        if step != self.steps:
+            raise ValueError("Checkpoint step must equal completed training steps")
+        self.evaluation_results = list(evaluation_results)
         extra_data = {
-            'step': step,
-            'memory': self.memory,
-            'policy_state': self.policy.get_config() if hasattr(self.policy, 'get_config') else None,
-            'evaluation_results': evaluation_results,
-            'losses': self.losses  # Save losses for plotting after resuming
+            'step': step, 'memory': self.memory,
+            'policy_state': self.policy.get_config(),
+            'evaluation_results': evaluation_results, 'losses': self.losses,
+            'numpy_random_state': np.random.get_state(),
+            'python_random_state': random.getstate(),
+            'agent_config': {name: getattr(self, name) for name in (
+                'gamma', 'tau', 'target_update_freq', 'num_burn_in', 'train_freq',
+                'batch_size', 'double_q', 'dueling', 'reward_clip', 'gradient_clip',
+            )},
         }
-        with open(os.path.join(self.checkpoint_dir, f'extra_data_{step}.pkl'), 'wb') as f:
-            pickle.dump(extra_data, f)
-    
-        self.logger.info(f"Checkpoint saved at step {step}")
+        extra_path = Path(self.checkpoint_dir) / f'extra_data_{step}.pkl.gz'
+        temporary = extra_path.with_suffix('.gz.tmp')
+        with gzip.open(temporary, 'wb', compresslevel=1) as handle:
+            pickle.dump(extra_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        temporary.replace(extra_path)
+        path = self.checkpoint_manager.save(checkpoint_number=step)
+        retained = {self._checkpoint_step(p) for p in self.checkpoint_manager.checkpoints}
+        for old in Path(self.checkpoint_dir).glob('extra_data_*.pkl.gz'):
+            saved_step = int(old.name.removeprefix('extra_data_').removesuffix('.pkl.gz'))
+            if saved_step not in retained:
+                old.unlink()
+        self.logger.info("Checkpoint saved at step %d: %s", step, path)
+        return path
 
     def load_checkpoint(self, checkpoint_path, step=None):
-        loaded_step = 0  # Default value to avoid UnboundLocalError
-        
-        if checkpoint_path.endswith('.pkl'):
-            with open(checkpoint_path, 'rb') as f:
-                checkpoint_data = pickle.load(f)
-        
-            print(f"Loaded checkpoint data keys: {checkpoint_data.keys()}")
-
-            if 'q_network_weights' in checkpoint_data:
-                self.q_network.set_weights(checkpoint_data['q_network_weights'])
-                if 'target_network_weights' in checkpoint_data:
-                    self.target_network.set_weights(checkpoint_data['target_network_weights'])
+        path = Path(checkpoint_path).expanduser()
+        data = None
+        if path.name.endswith(('.pkl', '.pkl.gz')):
+            opener = gzip.open if path.suffix == '.gz' else open
+            with opener(path, 'rb') as handle:
+                data = pickle.load(handle)
+            weights = data.get('q_network_weights', data.get('model'))
+            if weights is not None:
+                if step is not None and data.get('step', 0) != step:
+                    raise ValueError('Requested step does not match the legacy checkpoint')
+                self.q_network.set_weights(weights)
+                self.target_network.set_weights(data.get('target_network_weights', weights))
+                if 'optimizer_weights' in data:
+                    self.optimizer.set_weights(data['optimizer_weights'])
                 else:
-                    self.target_network.set_weights(self.q_network.get_weights())
-            elif 'model' in checkpoint_data:
-                self.q_network.set_weights(checkpoint_data['model'])
-                self.target_network.set_weights(checkpoint_data['model'])
-            else:
-                print("Warning: No model weights found in checkpoint. Using random initialization.")
+                    self.logger.warning('Legacy weights restored without optimizer state')
+                if 'target_network_weights' not in data:
+                    self.logger.warning('Legacy target weights synchronized from the online model')
+                self._restore_training_state(data)
+                return self.steps
+            candidates = [
+                candidate.with_suffix('') for candidate in path.parent.glob('*.index')
+                if self._checkpoint_step(candidate) == data['step']
+            ]
+            if not candidates:
+                raise FileNotFoundError("The sidecar has no matching TensorFlow checkpoint")
+            path = candidates[-1]
+        elif path.is_dir():
+            latest = tf.train.latest_checkpoint(str(path))
+            if latest is None:
+                raise FileNotFoundError(f"No checkpoint in {path}")
+            path = Path(latest)
+        elif path.suffix == '.index':
+            path = path.with_suffix('')
+        if not Path(str(path) + '.index').is_file():
+            raise FileNotFoundError(f"Checkpoint does not exist: {path}")
+        loaded_step = self._checkpoint_step(path)
+        if step is not None and step != loaded_step:
+            raise ValueError(f"Checkpoint is at step {loaded_step}, not {step}")
+        if data is None:
+            sidecar = path.parent / f'extra_data_{loaded_step}.pkl.gz'
+            if not sidecar.exists():
+                sidecar = path.parent / f'extra_data_{loaded_step}.pkl'
+            opener = gzip.open if sidecar.suffix == '.gz' else open
+            with opener(sidecar, 'rb') as handle:
+                data = pickle.load(handle)
+        if data['step'] != loaded_step:
+            raise ValueError("Checkpoint and replay sidecar steps do not match")
 
-            try:
-                if 'optimizer_weights' in checkpoint_data:
-                    self.optimizer.set_weights(checkpoint_data['optimizer_weights'])
-            except ValueError:
-                print("Warning: Failed to load optimizer weights. Reinitializing optimizer.")
-                self.optimizer = Adam(learning_rate=self.optimizer.learning_rate)
-        
-            if 'memory' in checkpoint_data:
-                self.memory = checkpoint_data['memory']
-            if 'policy_state' in checkpoint_data and hasattr(self.policy, 'set_config'):
-                self.policy.set_config(checkpoint_data['policy_state'])
-            if 'losses' in checkpoint_data:
-                self.losses = checkpoint_data['losses']
-        
-            loaded_step = checkpoint_data.get('step', 0)
-            self.logger.info(f"Checkpoint loaded from {checkpoint_path}")
+        has_target = any(
+            name.startswith('target_network/') for name, _ in tf.train.list_variables(str(path))
+        )
+        checkpoint = self.checkpoint if has_target else tf.train.Checkpoint(
+            model=self.q_network, optimizer=self.optimizer
+        )
+        status = checkpoint.restore(str(path))
+        status.assert_existing_objects_matched()
+        if not has_target:
+            status.expect_partial()
+            self.target_network.set_weights(self.q_network.get_weights())
+            self.logger.warning("Legacy checkpoint has no target weights; synchronized from online model")
+        if 'memory' not in data:
+            raise ValueError('Checkpoint sidecar is missing replay memory')
+        self._restore_training_state(data)
+        self.logger.info("Restored training from step %d: %s", self.steps, path)
+        return self.steps
+
+    def _restore_training_state(self, data):
+        if 'memory' in data:
+            memory = data['memory']
+            if (memory.frame_height, memory.frame_width, memory.history_length) != tuple(self.input_shape):
+                raise ValueError('Checkpoint replay shape does not match the network input')
+            self.memory = memory
         else:
-            # Handle TensorFlow checkpoint directory
-            checkpoint = tf.train.Checkpoint(model=self.q_network, optimizer=self.optimizer)
-            latest_checkpoint = tf.train.latest_checkpoint(checkpoint_path)
-            if latest_checkpoint:
-                checkpoint.restore(latest_checkpoint)
-                # Try to extract step from checkpoint filename
-                try:
-                    loaded_step = int(latest_checkpoint.split('_')[-1].split('-')[0])
-                except (ValueError, IndexError):
-                    loaded_step = step if step is not None else 0
-                self.target_network.set_weights(self.q_network.get_weights())
-                self.logger.info(f"TensorFlow checkpoint loaded from {latest_checkpoint}")
-                
-                # Try to load extra data if available
-                extra_data_file = os.path.join(checkpoint_path, f'extra_data_{loaded_step}.pkl')
-                if os.path.exists(extra_data_file):
-                    with open(extra_data_file, 'rb') as f:
-                        extra_data = pickle.load(f)
-                    if 'memory' in extra_data:
-                        self.memory = extra_data['memory']
-                    if 'policy_state' in extra_data and hasattr(self.policy, 'set_config'):
-                        self.policy.set_config(extra_data['policy_state'])
-                    if 'losses' in extra_data:
-                        self.losses = extra_data['losses']
-            else:
-                print(f"Warning: No checkpoint found at {checkpoint_path}")
-                loaded_step = step if step is not None else 0
-                
-        return loaded_step
+            self.logger.warning('Legacy weights have no replay memory; using a fresh buffer')
+        if data.get('policy_state') is not None:
+            self.policy.set_config(data['policy_state'])
+        self.losses = data.get('losses', [])
+        self.evaluation_results = data.get('evaluation_results', [])
+        for name, value in data.get('agent_config', {}).items():
+            setattr(self, name, value)
+        if 'numpy_random_state' in data:
+            np.random.set_state(data['numpy_random_state'])
+        if 'python_random_state' in data:
+            random.setstate(data['python_random_state'])
+        self.steps = int(data.get('step', 0))
 
     def get_latest_checkpoint(self, checkpoint_dir):
-        latest_tf_checkpoint = tf.train.latest_checkpoint(checkpoint_dir)
-    
-        if latest_tf_checkpoint:
-            # Handle checkpoint filename format like 'checkpoint_100000-1'
-            try:
-                step = int(latest_tf_checkpoint.split('_')[-1].split('-')[0])
-            except (ValueError, IndexError):
-                self.logger.warning(f"Could not parse step from checkpoint: {latest_tf_checkpoint}")
-                return None, None
-            extra_data_file = os.path.join(checkpoint_dir, f'extra_data_{step}.pkl')
-            if os.path.exists(extra_data_file):
-                return latest_tf_checkpoint, step
-        return None, None
+        path = tf.train.latest_checkpoint(str(checkpoint_dir))
+        return (path, self._checkpoint_step(path)) if path else (None, None)
     def record_loss(self, loss):
         self.losses.append(loss)
 
@@ -393,13 +418,16 @@ class DQNAgent:
             effective_window = 1
             
         smoothed_losses = np.convolve(self.losses, np.ones(effective_window)/effective_window, mode='valid')
-        plt.figure(figsize=(10, 5))
-        plt.plot(smoothed_losses)
-        plt.title('Training Loss')
-        plt.xlabel('Training Steps')
-        plt.ylabel('Loss')
-        plt.savefig('Training_loss.png')
-        plt.close()
+        figure = Figure(figsize=(10, 5))
+        axes = figure.subplots()
+        axes.plot(smoothed_losses)
+        axes.set(title='Training Loss', xlabel='Gradient updates', ylabel='Loss')
+        figure.savefig(self.output_dir / 'Training_loss.png')
+
+    def close(self):
+        for handler in list(self.logger.handlers):
+            handler.close()
+            self.logger.removeHandler(handler)
 
 
 

@@ -2,27 +2,100 @@
 """Run Atari Environment with DQN."""
 """Supports: LINEAR, DQN, DOUBLE DQN, DUELING DQN"""
 import argparse
+from contextlib import ExitStack
+from dataclasses import asdict, dataclass, fields, replace
+import json
 import os
+from pathlib import Path
 import random
+import sys
+import time
+
+if not (3, 11) <= sys.version_info[:2] < (3, 14):
+    raise SystemExit('Use 64-bit Python 3.11-3.13 (recommended: Python 3.12). See README.md.')
+
 import numpy as np
 import tensorflow as tf
-import gym
-from gym.wrappers import RecordVideo
+import gymnasium as gym
+import ale_py
+from gymnasium.wrappers import RecordVideo
 import deeprl as tfrl
 from deeprl.dqn import DQNAgent
 from deeprl.policy import GreedyEpsilonPolicy, ExponentialDecayGreedyEpsilonPolicy
 from deeprl.preprocessors import AtariPreprocessor, HistoryPreprocessor, PreprocessorSequence
-import matplotlib.pyplot as plt
-import gc
+from matplotlib.figure import Figure
 
-gpus = tf.config.experimental.list_physical_devices('GPU')
-if gpus:
-    try:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        print("GPU enabled")
-    except RuntimeError as e:
-        print(f"Error enabling GPU memory growth: {e}")
+gym.register_envs(ale_py)
+
+
+@dataclass
+class TrainingConfig:
+    """Shared defaults for the CLI, saved experiments and short smoke tests."""
+
+    env: str = 'ALE/SpaceInvaders-v5'
+    mode: str = 'deep'
+    output: str = 'atari-v0'
+    seed: int = 0
+    iterations: int = 1000000
+    frame_size: int = 84
+    history_length: int = 4
+    hidden_units: int = 512
+    memory_size: int = 500000
+    batch_size: int = 64
+    burn_in: int = 50000
+    gamma: float = 0.99
+    learning_rate: float = 3e-4
+    train_freq: int = 4
+    target_update_freq: int = 5000
+    tau: float = 0.001
+    epsilon_start: float = 1.0
+    epsilon_end: float = 0.05
+    epsilon_decay: float = 1e-5
+    reward_clip: float = 1.0
+    gradient_clip: float = 5.0
+    checkpoint_dir: str = 'checkpoints'
+    checkpoint_freq: int = 50000
+    keep_checkpoints: int = 2
+    restart_freq: int = 500000
+    eval_freq: int = 10000
+    eval_episodes: int = 10
+    final_eval_episodes: int = 100
+    max_episode_length: int = 27000
+    record_video: bool = True
+    video_freq: int = 100
+    video_length: int = 1000
+    threads: int = 0
+    log_freq: int = 1000
+
+    def smoke_test(self):
+        limits = dict(iterations=128, memory_size=256, batch_size=8, burn_in=16,
+                      target_update_freq=32, checkpoint_freq=64, eval_freq=64,
+                      eval_episodes=1, final_eval_episodes=1, max_episode_length=64,
+                      video_length=64, log_freq=64)
+        return replace(self, **{name: min(getattr(self, name), cap) for name, cap in limits.items()},
+                       threads=min(self.threads or 2, 2))
+
+    def validate(self):
+        nonnegative = {'seed', 'burn_in', 'checkpoint_freq', 'restart_freq', 'eval_freq',
+                       'eval_episodes', 'final_eval_episodes', 'threads'}
+        for field in fields(self):
+            value = getattr(self, field.name)
+            if field.type is int and (type(value) is not int or value < (0 if field.name in nonnegative else 1)):
+                raise ValueError(f'Invalid value for {field.name}: {value}')
+            if field.type is float and (not np.isfinite(value) or value < 0):
+                raise ValueError(f'Invalid value for {field.name}: {value}')
+        if not 0 <= self.gamma <= 1 or not 0 < self.tau <= 1:
+            raise ValueError('gamma must be in [0, 1] and tau in (0, 1]')
+        if not 0 <= self.epsilon_end <= self.epsilon_start <= 1:
+            raise ValueError('Require 0 <= epsilon_end <= epsilon_start <= 1')
+        if min(self.learning_rate, self.reward_clip, self.gradient_clip) <= 0:
+            raise ValueError('Learning rate and clipping thresholds must be positive')
+        if self.memory_size < max(self.batch_size, self.history_length + 1):
+            raise ValueError('memory_size must accommodate batch_size and frame history')
+        path = Path(self.checkpoint_dir)
+        if path.is_absolute() or '..' in path.parts or path == Path('.'):
+            raise ValueError('checkpoint_dir must be a subdirectory of the run folder')
+
 
 def create_optimizer():
     """Create Adam optimizer with standard learning rate."""
@@ -30,50 +103,63 @@ def create_optimizer():
 
 def create_linear_model(input_shape, num_actions, model_name='linear_q_network'):
     """Create a linear Q-network."""
+    num_actions = int(num_actions)
     model = tf.keras.Sequential([
-        tf.keras.layers.Flatten(input_shape=input_shape),
+        tf.keras.Input(shape=input_shape),
+        tf.keras.layers.Flatten(),
         tf.keras.layers.Dense(num_actions, activation=None)  # Linear output layer
     ])
     model.compile(optimizer=create_optimizer(), loss='mse')
     return model
 
-def create_deep_q_network(input_shape, num_actions, model_name='deep_q_network'):
+def create_deep_q_network(input_shape, num_actions, model_name='deep_q_network', hidden_units=TrainingConfig.hidden_units):
     """Create a deep Q-network with CNN architecture."""
+    num_actions = int(num_actions)
     inputs = tf.keras.Input(shape=(input_shape[0], input_shape[1], input_shape[2]))
     x = tf.keras.layers.Conv2D(32, (8, 8), strides=4, activation='relu')(inputs)
     x = tf.keras.layers.Conv2D(64, (4, 4), strides=2, activation='relu')(x)
     x = tf.keras.layers.Conv2D(64, (3, 3), strides=1, activation='relu')(x)
     
     x = tf.keras.layers.Flatten()(x)
-    x = tf.keras.layers.Dense(512, activation='relu')(x)  
+    x = tf.keras.layers.Dense(hidden_units, activation='relu')(x)
     outputs = tf.keras.layers.Dense(num_actions, activation=None)(x)
     model = tf.keras.Model(inputs=inputs, outputs=outputs, name=model_name)
     model.compile(optimizer=create_optimizer(), loss='huber') 
     return model
 
-def create_dueling_q_network(input_shape, num_actions, model_name='dueling_q_network'):
+def create_dueling_q_network(input_shape, num_actions, model_name='dueling_q_network', hidden_units=TrainingConfig.hidden_units):
     """Create a dueling deep Q-network."""
+    num_actions = int(num_actions)
     inputs = tf.keras.Input(shape=(input_shape[0], input_shape[1], input_shape[2]))
     x = tf.keras.layers.Conv2D(32, (8, 8), strides=4, activation='relu')(inputs)
     x = tf.keras.layers.Conv2D(64, (4, 4), strides=2, activation='relu')(x)
     x = tf.keras.layers.Conv2D(64, (3, 3), strides=1, activation='relu')(x)
     x = tf.keras.layers.Flatten()(x)
-    value_stream = tf.keras.layers.Dense(512, activation='relu')(x)
+    value_stream = tf.keras.layers.Dense(hidden_units, activation='relu')(x)
     value = tf.keras.layers.Dense(1)(value_stream)
-    advantage_stream = tf.keras.layers.Dense(512, activation='relu')(x)
+    advantage_stream = tf.keras.layers.Dense(hidden_units, activation='relu')(x)
     advantage = tf.keras.layers.Dense(num_actions)(advantage_stream)
-    q_values = value + (advantage - tf.reduce_mean(advantage, axis=1, keepdims=True))
+    q_values = value + (advantage - tf.keras.ops.mean(advantage, axis=1, keepdims=True))
     model = tf.keras.Model(inputs=inputs, outputs=q_values, name=model_name)
     model.compile(optimizer=create_optimizer(), loss='huber')
     return model
 
-def make_env(env_name, output_directory, record_video=True):
-    os.makedirs(output_directory, exist_ok=True)
-    # Use render_mode='rgb_array' for video recording compatibility
-    env = gym.make(env_name, render_mode='rgb_array')
-    if record_video:
-        env = RecordVideo(env, video_folder=output_directory, episode_trigger=lambda x: x % 100 == 0)
-    return env
+def make_env(env_name, output_directory=None, record_video=True, *, video_freq=TrainingConfig.video_freq,
+             video_length=TrainingConfig.video_length, max_episode_length=TrainingConfig.max_episode_length):
+    env = gym.make(env_name, render_mode='rgb_array' if record_video else None,
+                   max_episode_steps=max_episode_length)
+    try:
+        if record_video:
+            if output_directory is None:
+                raise ValueError('Video recording requires an output directory')
+            video_directory = Path(output_directory) / f'session-{time.time_ns()}'
+            env = RecordVideo(env, video_folder=str(video_directory),
+                              episode_trigger=lambda episode: episode % video_freq == 0,
+                              video_length=video_length)
+        return env
+    except Exception:
+        env.close()
+        raise
 
 def get_output_folder(parent_dir, env_name):
     """Return save folder."""
@@ -103,15 +189,13 @@ def plot_learning_curve(evaluation_results, output_dir, mode):
         return
     
     steps, means, stds = zip(*evaluation_results)
-    plt.figure(figsize=(10, 6))
-    plt.plot(steps, means)
-    plt.fill_between(steps, [m-s for m,s in zip(means, stds)], [m+s for m,s in zip(means, stds)], alpha=0.2)
-    plt.title(f'Learning Curve for {mode.capitalize()} Q-Network')
-    plt.xlabel('Steps')
-    plt.ylabel('Mean Reward')
+    figure = Figure(figsize=(10, 6))
+    axes = figure.subplots()
+    axes.plot(steps, means)
+    axes.fill_between(steps, [m-s for m,s in zip(means, stds)], [m+s for m,s in zip(means, stds)], alpha=0.2)
+    axes.set(title=f'Learning Curve for {mode.capitalize()} Q-Network', xlabel='Steps', ylabel='Mean Reward')
     os.makedirs(output_dir, exist_ok=True)
-    plt.savefig(os.path.join(output_dir, f'{mode}_learning_curve.png'))
-    plt.close()
+    figure.savefig(os.path.join(output_dir, f'{mode}_learning_curve.png'))
 
 def create_final_evaluation_table(results):
     """Create a table with final evaluation results for all models."""
@@ -121,175 +205,177 @@ def create_final_evaluation_table(results):
         table += f"{model:10} | {mean:.2f} +/- {std:.2f}\n"
     return table
 
-def main():
-    try:
-        parser = argparse.ArgumentParser(description='Run DQN on Atari Space Invaders')
-        parser.add_argument('--env', default='ALE/SpaceInvaders-v5', help='Atari env name')
-        parser.add_argument('-o', '--output', default='atari-v0', help='Directory to save data to')
-        parser.add_argument('--seed', default=0, type=int, help='Random seed')
-        parser.add_argument('--mode', required=True, choices=['linear', 'linear_double', 'deep', 'double', 'dueling'],
-                            help='Type of Q-network to train')
-        parser.add_argument('--iterations', type=int, default=1000000, help='Number of training iterations')
-        parser.add_argument('--checkpoint_dir', default='checkpoints', help='Directory to save checkpoints')
-        parser.add_argument('--checkpoint_freq', type=int, default=50000, help='Frequency of saving checkpoints')
-        parser.add_argument('--restart_freq', type=int, default=500000, help='Frequency of restarting the training')
-        parser.add_argument('--start_step', type=int, default=0, help='Step to start or resume training from')
-        parser.add_argument('--checkpoint_file', type=str, help='Specific checkpoint file to load') 
-        args = parser.parse_args()
-        
-        np.random.seed(args.seed)
-        tf.random.set_seed(args.seed)
-        random.seed(args.seed)
-
-        output_dir = get_output_folder(os.path.join(args.output, args.mode), args.env)
-        checkpoint_dir = os.path.join(output_dir, args.checkpoint_dir)
-        output_directory = os.path.join(output_dir, "videos")
-        env = make_env(args.env, output_directory)
-        num_actions = env.action_space.n
-        input_shape = (84, 84, 4)
-
-        total_iterations = args.iterations
-        iterations_done = 0
-        all_evaluation_results = []
-        
-        # Create policy and memory outside the loop to preserve state across restarts
-        policy = ExponentialDecayGreedyEpsilonPolicy(
-            GreedyEpsilonPolicy(1.0),
-            start_value=1.0,
-            end_value=0.05,
-            decay_rate=1e-5
-        )
-        memory = tfrl.core.ReplayMemory(max_size=500000, frame_height=84, frame_width=84, history_length=4)
-        
-        # Flag to track if this is the first iteration (for checkpoint loading)
-        first_iteration = True
-
-        while iterations_done < total_iterations:
-            if args.mode == 'linear' or args.mode == 'linear_double':
-                model = create_linear_model(input_shape, num_actions)
-            elif args.mode == 'deep' or args.mode == 'double':
-                model = create_deep_q_network(input_shape, num_actions)
-            elif args.mode == 'dueling':
-                model = create_dueling_q_network(input_shape, num_actions)
-
-            atari_preprocessor = AtariPreprocessor(new_size=(84, 84))
-            history_preprocessor = HistoryPreprocessor(history_length=4)
-            preprocessor = PreprocessorSequence([atari_preprocessor, history_preprocessor])
-
-            agent = DQNAgent(
-                model=model,
-                input_shape=input_shape,
-                num_actions=num_actions,
-                preprocessor=preprocessor,
-                memory=memory,
-                policy=policy,
-                gamma=0.99,
-                target_update_freq=5000,
-                num_burn_in=50000,
-                train_freq=4,
-                batch_size=64,
-                double_q=args.mode in ['linear_double', 'double'],
-                dueling=args.mode == 'dueling',
-                tau=0.001,
-                checkpoint_dir=checkpoint_dir
-            )
-
-            # Only load checkpoint on first iteration
-            if first_iteration:
-                # Ensure checkpoint directory exists before trying to load
-                os.makedirs(checkpoint_dir, exist_ok=True)
-                
-                if args.checkpoint_file:
-                    checkpoint_path = os.path.join(checkpoint_dir, args.checkpoint_file)
-                    if os.path.exists(checkpoint_path):
-                        step = agent.load_checkpoint(checkpoint_path)
-                        args.start_step = step
-                        # Update memory and policy references after loading
-                        memory = agent.memory
-                        policy = agent.policy
-                        print(f"Resumed training from checkpoint: {checkpoint_path}")
-                    else:
-                        print(f"Specified checkpoint not found: {checkpoint_path}")
-                        args.start_step = 0
-                elif args.start_step > 0:
-                    # Try to find and load the latest checkpoint
-                    latest_tf_checkpoint = tf.train.latest_checkpoint(checkpoint_dir)
-                    if latest_tf_checkpoint:
-                        # Handle checkpoint filename format like 'checkpoint_100000-1'
-                        try:
-                            step = int(latest_tf_checkpoint.split('_')[-1].split('-')[0])
-                        except (ValueError, IndexError):
-                            print(f"Warning: Could not parse step from checkpoint: {latest_tf_checkpoint}")
-                            step = args.start_step
-                        agent.load_checkpoint(checkpoint_dir, step)
-                        args.start_step = step
-                        # Update memory and policy references after loading
-                        memory = agent.memory
-                        policy = agent.policy
-                        print(f"Resumed training from step {args.start_step}")
-                    else:
-                        print(f"No checkpoint found in {checkpoint_dir}, starting from beginning")
-                        args.start_step = 0
-                first_iteration = False
-
-            # Calculate the actual end step for this training session
-            # fit() iterates from start_step to num_iterations, so we need:
-            # end_step = start_step + remaining_iterations
-            remaining_iterations = total_iterations - iterations_done
-            end_step = args.start_step + remaining_iterations
-            
-            fit_result = agent.fit(
-                env, 
-                num_iterations=end_step,
-                start_step=args.start_step,
-                max_episode_length=None,
-                checkpoint_dir=checkpoint_dir,
-                checkpoint_freq=args.checkpoint_freq,
-                restart_freq=args.restart_freq
-            )
-            
-            # fit() now always returns 3 values: (evaluation_results, final_result, stop_step)
-            evaluation_results, final_result, actual_stop_step = fit_result
-
-            all_evaluation_results.extend(evaluation_results)
-
-            if final_result is None:
-                # Training was paused for restart
-                iterations_done += actual_stop_step - args.start_step
-                args.start_step = actual_stop_step
-                print(f"Restarting training from step {args.start_step}")
-                
-                # Reset environment for the next training session
-                env.close()
-                env = make_env(args.env, output_directory)
-            else:
-                # Training completed
-                break
-
-            del agent
-            gc.collect()
-            tf.keras.backend.clear_session()
-
-        plot_learning_curve(all_evaluation_results, output_dir, args.mode)
-        final_mean_reward, final_std_reward = final_result if final_result else (None, None)
-        
-        if final_mean_reward is not None and final_std_reward is not None:
-            print(f"Final Result for {args.mode} Q-network:")
-            print(f"Mean Reward: {final_mean_reward:.2f} +/- {final_std_reward:.2f}")
-            
-            # Note: 'agent' might have been deleted in the loop, so we need to check
-            # The final model should be saved inside the fit() method
-            with open(os.path.join(output_dir, 'final_results.txt'), 'w') as f:
-                f.write(f"Mode: {args.mode}\n")
-                f.write(f"Final Mean Reward: {final_mean_reward:.2f}\n")
-                f.write(f"Final Std Reward: {final_std_reward:.2f}\n")
+def build_parser():
+    parser = argparse.ArgumentParser(description='Train DQN on Atari Space Invaders')
+    descriptions = {
+        'iterations': 'Additional environment steps to train',
+        'burn_in': 'Completed steps before gradient updates start',
+        'memory_size': 'Replay capacity in single uint8 frames',
+        'tau': 'Target update weight (1 = periodic hard updates)',
+        'threads': 'TensorFlow CPU threads (0 = automatic)',
+        'restart_freq': 'Optional environment-reset interval; weights are retained (0 = off)',
+        'checkpoint_freq': 'Checkpoint interval (0 = final checkpoint only)',
+        'eval_freq': 'Periodic evaluation interval (0 = off)',
+        'video_length': 'Maximum frames per recorded clip',
+    }
+    for field in fields(TrainingConfig):
+        options = list(dict.fromkeys(('--' + field.name.replace('_', '-'), '--' + field.name)))
+        if field.name == 'output':
+            options.append('-o')
+        kwargs = dict(default=field.default, help=descriptions.get(field.name, field.name.replace('_', ' ')))
+        kwargs['help'] += f' (default: {field.default})'
+        if field.type is bool:
+            kwargs['action'] = argparse.BooleanOptionalAction
         else:
-            print("Training did not complete. No final results available.")
+            kwargs['type'] = field.type
+        if field.name == 'mode':
+            kwargs['choices'] = ['linear', 'linear_double', 'deep', 'double', 'dueling']
+        parser.add_argument(*options, **kwargs)
+    parser.add_argument('--smoke-test', '--smoke_test', action='store_true',
+                        help='Cap training at 128 steps, use small replay and at most 2 CPU threads')
+    parser.add_argument('--resume', type=Path, help='Existing run directory to resume')
+    parser.add_argument('--checkpoint-file', '--checkpoint_file', type=Path,
+                        help='Specific trusted TensorFlow checkpoint prefix, directory or sidecar')
+    parser.add_argument('--start-step', '--start_step', type=int, default=0,
+                        help='Optional expected resume step; requires a checkpoint')
+    return parser
 
-    except Exception as e:
-        print(f"An error occurred: {e}")
-        import traceback
-        traceback.print_exc()
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    run_dir, saved_config = None, None
+    source = args.resume or args.checkpoint_file
+    try:
+        if source is not None:
+            source = source.expanduser().resolve()
+            if args.resume and not (source / 'config.json').is_file():
+                raise ValueError('--resume expects a run directory; use --checkpoint-file for a specific checkpoint')
+            run_dir = next((path for path in (source, source.parent, source.parent.parent)
+                            if (path / 'config.json').is_file()), None)
+            if args.resume and run_dir is None:
+                raise ValueError('--resume must point to an existing run containing config.json')
+            if run_dir is not None:
+                with (run_dir / 'config.json').open(encoding='utf-8') as handle:
+                    saved_config = json.load(handle)
+                parser.set_defaults(**{field.name: saved_config[field.name] for field in fields(TrainingConfig)
+                                       if field.name in saved_config})
+                args = parser.parse_args(argv)
+        config = TrainingConfig(**{field.name: getattr(args, field.name) for field in fields(TrainingConfig)})
+        if args.smoke_test:
+            config = config.smoke_test()
+        config.validate()
+        if args.start_step < 0 or (args.start_step and source is None):
+            raise ValueError('--start-step requires a checkpoint; it cannot skip untrained steps')
+        if saved_config is not None:
+            fixed = ('env', 'mode', 'frame_size', 'history_length', 'hidden_units',
+                     'memory_size', 'batch_size', 'burn_in', 'gamma', 'learning_rate',
+                     'train_freq', 'target_update_freq', 'tau', 'epsilon_start',
+                     'epsilon_end', 'epsilon_decay', 'reward_clip', 'gradient_clip', 'checkpoint_dir')
+            for name in fixed:
+                if name in saved_config and getattr(config, name) != saved_config[name]:
+                    raise ValueError(f'Cannot change {name} when resuming this run')
+
+        checkpoint = None
+        if source is not None:
+            checkpoint = args.checkpoint_file or (run_dir / config.checkpoint_dir)
+            checkpoint = checkpoint.expanduser()
+            if args.checkpoint_file and run_dir is not None and not checkpoint.is_absolute():
+                candidate = run_dir / config.checkpoint_dir / checkpoint
+                if candidate.exists() or Path(str(candidate) + '.index').is_file():
+                    checkpoint = candidate
+            if checkpoint.is_dir():
+                latest = tf.train.latest_checkpoint(str(checkpoint))
+                if latest is None:
+                    raise FileNotFoundError(f'No checkpoint found in {checkpoint}')
+                checkpoint = Path(latest)
+            elif not checkpoint.is_file() and not Path(str(checkpoint) + '.index').is_file():
+                raise FileNotFoundError(f'Checkpoint does not exist: {checkpoint}')
+
+        if config.threads:
+            tf.config.threading.set_intra_op_parallelism_threads(config.threads)
+            tf.config.threading.set_inter_op_parallelism_threads(config.threads)
+        gpus = tf.config.list_physical_devices('GPU')
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print(f"TensorFlow {tf.__version__}; device: {'GPU' if gpus else 'CPU'}")
+        np.random.seed(config.seed)
+        tf.random.set_seed(config.seed)
+        random.seed(config.seed)
+
+        output_dir = run_dir or Path(get_output_folder(os.path.join(config.output, config.mode), config.env))
+        output_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_dir = output_dir / config.checkpoint_dir
+        input_shape = (config.frame_size, config.frame_size, config.history_length)
+        with ExitStack() as resources:
+            env = make_env(config.env, output_dir / 'videos', config.record_video,
+                           video_freq=config.video_freq, video_length=config.video_length,
+                           max_episode_length=config.max_episode_length)
+            resources.callback(env.close)
+            eval_env = make_env(config.env, record_video=False, max_episode_length=config.max_episode_length)
+            resources.callback(eval_env.close)
+            if config.mode in ('linear', 'linear_double'):
+                model = create_linear_model(input_shape, env.action_space.n)
+            elif config.mode in ('deep', 'double'):
+                model = create_deep_q_network(input_shape, env.action_space.n, hidden_units=config.hidden_units)
+            else:
+                model = create_dueling_q_network(input_shape, env.action_space.n, hidden_units=config.hidden_units)
+
+            policy = ExponentialDecayGreedyEpsilonPolicy(
+                GreedyEpsilonPolicy(config.epsilon_start), config.epsilon_start,
+                config.epsilon_end, config.epsilon_decay,
+            )
+            capacity = config.memory_size if checkpoint is None else max(config.batch_size, config.history_length + 1)
+            memory = tfrl.core.ReplayMemory(capacity, config.frame_size, config.frame_size, config.history_length)
+            preprocessor = PreprocessorSequence([
+                AtariPreprocessor(new_size=(config.frame_size, config.frame_size)),
+                HistoryPreprocessor(history_length=config.history_length),
+            ])
+            agent = DQNAgent(
+                model=model, input_shape=input_shape, num_actions=env.action_space.n,
+                preprocessor=preprocessor, memory=memory, policy=policy,
+                gamma=config.gamma, target_update_freq=config.target_update_freq,
+                num_burn_in=config.burn_in, train_freq=config.train_freq, batch_size=config.batch_size,
+                double_q=config.mode in ('linear_double', 'double'), dueling=config.mode == 'dueling',
+                tau=config.tau, checkpoint_dir=checkpoint_dir, output_dir=output_dir,
+                learning_rate=config.learning_rate, keep_checkpoints=config.keep_checkpoints,
+                reward_clip=config.reward_clip, gradient_clip=config.gradient_clip,
+            )
+            resources.callback(agent.close)
+            if checkpoint is not None:
+                agent.load_checkpoint(checkpoint, step=args.start_step or None)
+                if agent.memory is memory:
+                    agent.memory = tfrl.core.ReplayMemory(
+                        config.memory_size, config.frame_size, config.frame_size, config.history_length
+                    )
+
+            with (output_dir / 'config.json').open('w', encoding='utf-8') as handle:
+                json.dump(asdict(config), handle, indent=2)
+            print(f'Run directory: {output_dir.resolve()}')
+            print(f'Replay frame capacity: {agent.memory.frames.nbytes / 1024 ** 2:.1f} MiB')
+            try:
+                evaluation_results, final_result, _ = agent.fit(
+                    env, num_iterations=agent.steps + config.iterations, start_step=agent.steps,
+                    max_episode_length=config.max_episode_length, checkpoint_freq=config.checkpoint_freq,
+                    restart_freq=config.restart_freq, eval_env=eval_env, eval_freq=config.eval_freq,
+                    eval_episodes=config.eval_episodes, final_eval_episodes=config.final_eval_episodes,
+                    seed=config.seed, log_freq=config.log_freq,
+                )
+            except KeyboardInterrupt:
+                agent.save_checkpoint(agent.steps, agent.evaluation_results)
+                print(f'Training interrupted at step {agent.steps}; checkpoint saved.')
+                return 130
+            plot_learning_curve(evaluation_results, output_dir, config.mode)
+            with (output_dir / 'final_results.txt').open('w', encoding='utf-8') as handle:
+                handle.write(f'Mode: {config.mode}\nCompleted steps: {agent.steps}\n')
+                handle.write(f'Gradient updates: {int(agent.optimizer.iterations.numpy())}\n')
+                if final_result is not None:
+                    mean, std = final_result
+                    handle.write(f'Final Mean Reward: {mean:.2f}\nFinal Std Reward: {std:.2f}\n')
+        return 0
+    except (ValueError, OSError) as error:
+        parser.error(str(error))
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -46,136 +46,143 @@ class Preprocessor:
 
 
 class ReplayMemory:
+    """Frame-efficient replay with separate episode boundaries and TD terminals."""
+
     def __init__(self, max_size, frame_height, frame_width, history_length=4):
+        if history_length < 1 or max_size < history_length + 1:
+            raise ValueError("Replay capacity must be greater than history_length")
+        if frame_height < 1 or frame_width < 1:
+            raise ValueError("Frame dimensions must be positive")
         self.max_size = max_size
         self.frame_height = frame_height
         self.frame_width = frame_width
         self.history_length = history_length
         self.frames = np.zeros((max_size, frame_height, frame_width), dtype=np.uint8)
-        self.actions = np.zeros(max_size, dtype=np.int32)  # Use int32 to support larger action spaces
+        self.actions = np.zeros(max_size, dtype=np.int32)
         self.rewards = np.zeros(max_size, dtype=np.float32)
-        self.dones = np.zeros(max_size, dtype=bool)       
+        self.dones = np.zeros(max_size, dtype=bool)
+        self.terminals = np.zeros(max_size, dtype=bool)
+        self.episode_starts = np.zeros(max_size, dtype=bool)
         self.current = 0
         self.count = 0
+        self._new_episode = True
+        # Only the newest transition and non-terminal episode boundaries need
+        # an extra frame. All other successors already live in the ring buffer.
+        self._next_frames = {}
 
-    def append(self, frame, action, reward, done):
+    def append(self, frame, action, reward, done, next_frame=None, terminal=None):
+        if np.shape(frame) != (self.frame_height, self.frame_width):
+            raise ValueError("Unexpected replay frame shape")
+        if next_frame is not None and np.shape(next_frame) != np.shape(frame):
+            raise ValueError("Unexpected successor frame shape")
+        terminal = bool(done) if terminal is None else bool(terminal)
+        if terminal and not done:
+            raise ValueError("A terminal transition must end the episode")
+        if self.count and not self._new_episode:
+            self._next_frames.pop((self.current - 1) % self.max_size, None)
+        self._next_frames.pop(self.current, None)
         self.frames[self.current] = frame
         self.actions[self.current] = action
         self.rewards[self.current] = reward
         self.dones[self.current] = done
-        
-        self.count = max(self.count, self.current + 1)
+        self.terminals[self.current] = terminal
+        self.episode_starts[self.current] = self._new_episode
+        if next_frame is not None and not terminal:
+            self._next_frames[self.current] = np.array(next_frame, dtype=np.uint8, copy=True)
+        self._new_episode = bool(done)
+        self.count = min(self.count + 1, self.max_size)
         self.current = (self.current + 1) % self.max_size
 
+    def start_new_episode(self):
+        """Break frame history after an external reset, including resume."""
+        if self.count:
+            self.dones[(self.current - 1) % self.max_size] = True
+        self._new_episode = True
+
+    def _has_history(self, index):
+        oldest = self.current if self.count == self.max_size else 0
+        for offset in range(self.history_length):
+            cursor = (index - offset) % self.max_size
+            if self.episode_starts[cursor] or offset == self.history_length - 1:
+                return True
+            if cursor == oldest:
+                return False
+        return False
+
+    def _is_valid(self, index):
+        if not self._has_history(index):
+            return False
+        if self.terminals[index] or index in self._next_frames:
+            return True
+        newest = (self.current - 1) % self.max_size
+        return index != newest and not self.dones[index]
+
     def sample(self, batch_size):
-        max_index = min(self.count, self.max_size)
-        
-        # Need at least history_length + 2 frames to sample:
-        # - history_length frames for the current state
-        # - 1 frame for the next state's last frame (index + 1)
-        # - So we need indices from [history_length, max_index-1), which requires max_index > history_length + 1
-        if max_index <= self.history_length + 1:
-            raise ValueError(f"Not enough samples in memory. Have {max_index}, need at least {self.history_length + 2}")
-        
-        # Ensure we don't sample from indices that would wrap around incorrectly
-        # or sample terminal states as the "current" state
-        valid_indices = []
-        max_attempts = batch_size * 10  # Prevent infinite loop
-        attempts = 0
-        
-        while len(valid_indices) < batch_size and attempts < max_attempts:
-            # Sample index for the state (the frame from which action was taken)
-            # We need idx and idx+1 to be valid, so sample from [history_length, max_index-1)
-            # idx must be >= history_length to ensure we have enough frames for the state stack
-            idx = np.random.randint(self.history_length, max_index - 1)
-            attempts += 1
-            
-            # Skip if state history crosses an episode boundary
-            #
-            # state s = frames[idx-history_length+1, ..., idx-1, idx]
-            # next_state s' = frames[idx-history_length+2, ..., idx, idx+1]
-            # 
-            # We need to check that:
-            # 1. dones[idx-history_length+1] to dones[idx-1] are all False 
-            #    (so state stack doesn't cross episode boundaries)
-            # Note: dones[idx] can be True (terminal transition is valid)
-            #
-            # We check dones at indices: idx-history_length+1, ..., idx-1
-            # which corresponds to i in range(1, history_length) for check_idx = idx - i
-            valid = True
-            for i in range(1, self.history_length):
-                check_idx = (idx - i) % self.max_size
-                if self.dones[check_idx]:
-                    valid = False
+        if batch_size < 1 or not self.count:
+            raise ValueError("Cannot sample an empty replay buffer or an empty batch")
+        indices = []
+        for index in np.random.randint(self.count, size=batch_size * 20):
+            if self._is_valid(index):
+                indices.append(index)
+                if len(indices) == batch_size:
                     break
-            
-            # Also avoid sampling the current write position if buffer is full
-            if self.count >= self.max_size:
-                if abs(idx - self.current) < self.history_length + 1:
-                    valid = False
-            
-            if valid:
-                valid_indices.append(idx)
-        
-        # If we couldn't find enough valid samples, fall back to random sampling
-        if len(valid_indices) < batch_size:
-            remaining = batch_size - len(valid_indices)
-            fallback_indices = np.random.randint(self.history_length, max_index - 1, size=remaining)
-            valid_indices.extend(fallback_indices.tolist())
-        
-        indices = np.array(valid_indices)
-        
-        # Memory layout: at index i, we store:
-        # - frames[i]: the last frame of the state from which actions[i] was taken
-        # - actions[i]: the action taken from the state ending at frames[i]
-        # - rewards[i]: the reward received for taking actions[i]
-        # - dones[i]: whether the episode ended after taking actions[i]
-        
-        states = np.array([self._get_state(index) for index in indices], dtype=np.float32) / 255.0
-        
-        # For terminal states, next_state doesn't matter (Q-value is 0)
-        # But we still need to provide a valid next_state array
-        # For non-terminal states, get the actual next state
-        next_states = np.array([self._get_state(index + 1) for index in indices], dtype=np.float32) / 255.0
-        
-        # Use the sampled index directly to get the action, reward, and done for the transition
-        actions = self.actions[indices]
-        rewards = self.rewards[indices]
-        dones = self.dones[indices].astype(np.float32)
-        
-        return states, actions, rewards, next_states, dones
+        if len(indices) < batch_size:
+            valid = [i for i in range(self.count) if self._is_valid(i)]
+            if not valid:
+                raise ValueError("Replay buffer has no complete transitions")
+            indices = np.random.choice(valid, size=batch_size).tolist()
+
+        states = np.stack([self._get_state(i) for i in indices])
+        next_states = np.zeros_like(states)
+        for row, index in enumerate(indices):
+            if not self.terminals[index]:
+                next_frame = self._next_frames.get(index)
+                if next_frame is None:
+                    next_frame = self.frames[(index + 1) % self.max_size]
+                next_states[row, ..., :-1] = states[row, ..., 1:]
+                next_states[row, ..., -1] = next_frame
+        return (
+            states.astype(np.float32) / 255.0,
+            self.actions[indices],
+            self.rewards[indices],
+            next_states.astype(np.float32) / 255.0,
+            self.terminals[indices].astype(np.float32),
+        )
 
     def _get_state(self, index):
-        """Get a state consisting of history_length consecutive frames ending at index.
-        
-        Parameters
-        ----------
-        index: int
-            The index of the last frame in the state stack.
-            
-        Returns
-        -------
-        np.ndarray
-            A stack of history_length frames with shape (frame_height, frame_width, history_length).
-        """
-        # Wrap index to handle circular buffer
-        index = index % self.max_size
-        
-        # When buffer is full, we can always use circular indexing
-        # When buffer is not full, we need to handle the case where index < history_length - 1
-        if self.count < self.max_size and index < self.history_length - 1:
-            # Buffer not full and not enough frames before this index, pad with first frame
-            frames = []
-            for i in range(self.history_length):
-                frame_idx = index - (self.history_length - 1 - i)
-                if frame_idx < 0:
-                    frames.append(self.frames[0])  # Pad with first frame
-                else:
-                    frames.append(self.frames[frame_idx])
-        else:
-            # Buffer is full or we have enough frames, use circular indexing
-            frames = [self.frames[(index - self.history_length + 1 + i) % self.max_size] for i in range(self.history_length)]
-        return np.stack(frames, axis=-1)
+        """Reconstruct history, zero-padding only at actual episode starts."""
+        if not 0 <= index < self.count or not self._has_history(index):
+            raise ValueError("The requested frame history has been overwritten")
+        state = np.zeros(
+            (self.frame_height, self.frame_width, self.history_length), dtype=np.uint8
+        )
+        for offset in range(self.history_length):
+            cursor = (index - offset) % self.max_size
+            state[..., self.history_length - 1 - offset] = self.frames[cursor]
+            if self.episode_starts[cursor]:
+                break
+        return state
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        for name, value in state.items():
+            if isinstance(value, np.ndarray):
+                state[name] = value[:self.count]
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        # Older checkpoints did not distinguish truncation from termination.
+        if 'terminals' not in state:
+            self.terminals = self.dones.copy()
+            self.episode_starts = np.roll(self.dones, 1)
+            self.episode_starts[self.current if self.count == self.max_size else 0] = self.count < self.max_size
+            self._next_frames, self._new_episode = {}, True
+        for name, value in list(self.__dict__.items()):
+            if isinstance(value, np.ndarray) and len(value) < self.max_size:
+                expanded = np.zeros((self.max_size, *value.shape[1:]), dtype=value.dtype)
+                expanded[:len(value)] = value
+                setattr(self, name, expanded)
 
     def __len__(self):
         return self.count

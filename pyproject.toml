@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atari-spaceinvaders-dqn"
+version = "0.2.0"
+description = "TensorFlow DQN variants for Atari Space Invaders"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dynamic = ["dependencies"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[project.scripts]
+train-atari = "dqn_atari:main"
+
+[tool.setuptools]
+packages = ["deeprl"]
+py-modules = ["dqn_atari"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: runs the real Atari emulator and training CLI"]
